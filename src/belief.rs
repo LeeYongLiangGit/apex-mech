@@ -147,12 +147,15 @@ impl BeliefMap {
             self.pings.drain(0..drain);
         }
 
-        // Strict Practice vs. FFA mode detection
-        if self.mode == MatchMode::Unknown {
-            let other_deaths = self
-                .prev_alive
-                .saturating_sub(obs.alive)
-                .saturating_sub(kills_this_tick);
+        // Strict Practice vs. FFA mode detection (allow PracticeHivemind -> FfaSurvival override)
+        if self.mode != MatchMode::FfaSurvival {
+            let other_deaths = if obs.tick > 1 {
+                self.prev_alive
+                    .saturating_sub(obs.alive)
+                    .saturating_sub(kills_this_tick)
+            } else {
+                0
+            };
 
             let verified_mech_vs_mech_beam = obs.beams.iter().any(|b| {
                 b.by != obs.me.id
@@ -160,7 +163,9 @@ impl BeliefMap {
                         obs.mechs.iter().any(|m| {
                             m.kind == "mech"
                                 && m.id != b.by
-                                && ((end[0] - m.pos[0]).powi(2) + (end[1] - m.pos[1]).powi(2)).sqrt() < 5.0
+                                && ((end[0] - m.pos[0]).powi(2) + (end[1] - m.pos[1]).powi(2))
+                                    .sqrt()
+                                    < 5.0
                         })
                     })
             });
@@ -169,7 +174,10 @@ impl BeliefMap {
                 || verified_mech_vs_mech_beam
             {
                 self.mode = MatchMode::FfaSurvival;
-            } else if obs.t > 32.0 && obs.alive + self.our_kills == 16 {
+            } else if self.mode == MatchMode::Unknown
+                && obs.t > 32.0
+                && obs.alive + self.our_kills == 16
+            {
                 self.mode = MatchMode::PracticeHivemind;
             }
         }

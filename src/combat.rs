@@ -377,7 +377,8 @@ pub fn select_target(
         .iter()
         .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
 
-    let mut best: Option<TargetInfo> = None;
+    let mut best_mech: Option<TargetInfo> = None;
+    let mut best_npc: Option<TargetInfo> = None;
 
     for m in &obs.mechs {
         let is_mech = m.kind == "mech";
@@ -409,15 +410,13 @@ pub fn select_target(
         let rear_exposed = angle_diff(m.aim[0], bearing_from_enemy).abs() > PI * 0.52;
 
         let mut score = if is_mech {
-            1060.0
+            1060.0 - d * 2.6 + (1400.0 - hp).max(0.0) * 0.90
         } else if obs.me.cubes < cfg.cube_stat_cap {
-            580.0
+            1525.0 - d * 2.6 + (350.0 - hp).max(0.0) * 0.90
         } else {
-            340.0
-        } - d * 2.6;
+            640.0 - d * 2.6 + (350.0 - hp).max(0.0) * 0.90
+        };
 
-        // Preserve Iter 8's aggressive NPC 2-cube farm priority + mech execute scaling
-        score += (1400.0 - hp).max(0.0) * 0.90;
         if is_mech && hp <= 420.0 {
             score += 310.0;
         }
@@ -443,29 +442,60 @@ pub fn select_target(
             score -= 360.0;
         }
 
-        if best.as_ref().map_or(true, |b| score > b.score) {
-            best = Some(TargetInfo {
-                id: m.id as u64,
-                pos: aim_pt,
-                feet_z: m.pos[2],
-                vel: m.vel,
-                dist: d,
-                hp,
-                los,
-                is_mech,
-                is_crate: false,
-                has_mortar: enemy_mortar,
-                has_lightning: enemy_lightning,
-                enemy_charging: m.charging,
-                score,
-            });
+        let info = TargetInfo {
+            id: m.id as u64,
+            pos: aim_pt,
+            feet_z: m.pos[2],
+            vel: m.vel,
+            dist: d,
+            hp,
+            los,
+            is_mech,
+            is_crate: false,
+            has_mortar: enemy_mortar,
+            has_lightning: enemy_lightning,
+            enemy_charging: m.charging,
+            score,
+        };
+
+        if is_mech {
+            if best_mech.as_ref().map_or(true, |b| info.score > b.score) {
+                best_mech = Some(info);
+            }
+        } else if best_npc.as_ref().map_or(true, |b| info.score > b.score) {
+            best_npc = Some(info);
         }
     }
 
-    let want_crates = obs.me.cubes < cfg.cube_stat_cap;
-    let active_mech_fight = best
+    let my_hp_frac = obs.me.hp / obs.me.max_hp.max(1.0);
+    let mech_urgent = best_mech.as_ref().map_or(false, |m| {
+        m.los
+            && (m.dist <= 55.0
+                || m.enemy_charging
+                || m.hp <= 450.0
+                || (my_hp_frac < 0.60 && m.dist <= 110.0))
+    });
+    let npc_one_shot = best_npc
         .as_ref()
-        .map_or(false, |b| b.is_mech && b.los && b.dist < 85.0);
+        .map_or(false, |n| n.los && n.hp <= 120.0 && n.dist <= 35.0);
+
+    let mut best: Option<TargetInfo> = match (best_mech.clone(), best_npc) {
+        (Some(m), Some(n)) => {
+            if mech_urgent && !npc_one_shot {
+                Some(m)
+            } else if n.score > m.score {
+                Some(n)
+            } else {
+                Some(m)
+            }
+        }
+        (Some(m), None) => Some(m),
+        (None, Some(n)) => Some(n),
+        (None, None) => None,
+    };
+
+    let want_crates = obs.me.cubes < cfg.cube_stat_cap;
+    let active_mech_fight = best_mech.as_ref().map_or(false, |b| b.los && b.dist < 85.0);
     if want_crates && !active_mech_fight {
         for c in &obs.crates {
             let pt = [c.pos[0], c.pos[1], c.pos[2] + 1.5];
@@ -621,52 +651,54 @@ pub fn decide_combat(
         return;
     }
 
-    // 1. Lightning inside range (240 DPS + chain + laser short)
+    // 1. Lightning inside range (only when not actively holding a laser charge)
     //    Twin-arm dual-fire: simultaneously fire Arm Gun when gun_lead sits inside Lightning cone!
-    if let Some((li, lw)) = lightning_slot {
-        let range = lw.stat_f64("range", 45.0);
-        let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
-        let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
-        if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
-            let mut chosen_aim = direct_aim;
-            let mut dual_gun: Option<(usize, [f64; 2])> = None;
+    if !laser_charging {
+        if let Some((li, lw)) = lightning_slot {
+            let range = lw.stat_f64("range", 45.0);
+            let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
+            let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
+            if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
+                let mut chosen_aim = direct_aim;
+                let mut dual_gun: Option<(usize, [f64; 2])> = None;
 
-            if let Some((gi, gw)) = gun_slot {
-                let g_range = gw.stat_f64("range", 230.0);
-                let g_speed = gw.stat_f64("speed", 252.0);
-                if gw.reload <= 0.0 && t.dist <= g_range {
-                    let lead = lead_aim(muzzle, t.pos, t.vel, g_speed, world);
-                    if angle_diff(lead[0], direct_aim[0]).abs() <= cone * 0.78 {
-                        chosen_aim = lead;
-                        dual_gun = Some((gi, lead));
+                if let Some((gi, gw)) = gun_slot {
+                    let g_range = gw.stat_f64("range", 230.0);
+                    let g_speed = gw.stat_f64("speed", 252.0);
+                    if gw.reload <= 0.0 && t.dist <= g_range {
+                        let lead = lead_aim(muzzle, t.pos, t.vel, g_speed, world);
+                        if angle_diff(lead[0], direct_aim[0]).abs() <= cone * 0.78 {
+                            chosen_aim = lead;
+                            dual_gun = Some((gi, lead));
+                        }
                     }
                 }
-            }
 
-            act.aim = chosen_aim;
-            let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate, pitch_rate);
-            if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
-                act.fire[li] = true;
-            }
-
-            if let Some((gi, lead)) = dual_gun {
-                let yaw_err = angle_diff(pred[0], lead[0]).abs();
-                let pitch_err = (pred[1] - lead[1]).abs();
-                let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
-                let dir = aim_dir(pred);
-                let barrel_tip = [
-                    muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
-                    muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
-                    muzzle[2] + dir[2] * (obs.me.radius() + 0.5),
-                ];
-                if yaw_err <= hit_tol
-                    && pitch_err <= hit_tol
-                    && world.raycast_solid(muzzle, barrel_tip).is_none()
-                {
-                    act.fire[gi] = true;
+                act.aim = chosen_aim;
+                let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate, pitch_rate);
+                if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
+                    act.fire[li] = true;
                 }
+
+                if let Some((gi, lead)) = dual_gun {
+                    let yaw_err = angle_diff(pred[0], lead[0]).abs();
+                    let pitch_err = (pred[1] - lead[1]).abs();
+                    let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
+                    let dir = aim_dir(pred);
+                    let barrel_tip = [
+                        muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
+                        muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
+                        muzzle[2] + dir[2] * (obs.me.radius() + 0.5),
+                    ];
+                    if yaw_err <= hit_tol
+                        && pitch_err <= hit_tol
+                        && world.raycast_solid(muzzle, barrel_tip).is_none()
+                    {
+                        act.fire[gi] = true;
+                    }
+                }
+                return;
             }
-            return;
         }
     }
 
@@ -700,12 +732,13 @@ pub fn decide_combat(
             let aligned = yaw_err <= hit_tol && pitch_err <= hit_tol;
 
             let dir = aim_dir(obs.me.aim);
-            let barrel_tip = [
-                muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
-                muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
-                muzzle[2] + dir[2] * (obs.me.radius() + 0.5),
+            let beam_check_dist = (t.dist - 3.0).max(obs.me.radius() + 0.5);
+            let beam_end = [
+                muzzle[0] + dir[0] * beam_check_dist,
+                muzzle[1] + dir[1] * beam_check_dist,
+                muzzle[2] + dir[2] * beam_check_dist,
             ];
-            let barrel_clear = world.raycast_solid(muzzle, barrel_tip).is_none();
+            let beam_clear = world.raycast_solid(muzzle, beam_end).is_none();
 
             let ready = w.charge >= full_charge - 0.04
                 || (w.charge >= min_charge && expected_dmg >= t.hp * 1.02)
@@ -724,8 +757,9 @@ pub fn decide_combat(
                 if let Some((li, lw)) = lightning_slot {
                     let l_range = lw.stat_f64("range", 45.0);
                     let l_cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
+                    let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
                     if t.dist <= l_range - 0.5
-                        && obs.me.energy >= 7.0
+                        && obs.me.energy >= energy_min
                         && angle_diff(pred[0], direct_aim[0]).abs() <= l_cone
                     {
                         act.fire[li] = true;
@@ -752,7 +786,7 @@ pub fn decide_combat(
                 }
             }
 
-            if ready && t.los && aligned && barrel_clear {
+            if ready && t.los && aligned && beam_clear {
                 act.fire[i] = false;
                 return;
             } else if w.charge >= full_charge + hold_s - 0.20

@@ -26,7 +26,7 @@ struct BotBrain {
     climb_stuck_ticks: u32,
     last_pos: [f64; 3],
     stuck_ticks: u32,
-    escape_cache: Option<([f64; 3], u64)>,
+    escape_cache: Option<([f64; 3], u64, usize)>,
 }
 
 impl BotBrain {
@@ -496,23 +496,33 @@ impl BotBrain {
         // 2. Ground-only building-corner escape ONLY when critically low HP (<48%) under LOS fire
         if seek_heal && los_enemies > 0 && !visible_threat_eyes.is_empty() {
             let safe_z_r = (obs.zone.radius - 5.0).max(5.0);
-            let reuse = self.escape_cache.filter(|&(pt, tick)| {
+            let world = &self.world;
+            let eye_off = obs.me.eye_height();
+            let cover_los = |pt: [f64; 3]| -> usize {
+                let pt_eye = [pt[0], pt[1], pt[2] + eye_off];
+                visible_threat_eyes
+                    .iter()
+                    .filter(|&&te| world.raycast_solid(te, pt_eye).is_none())
+                    .count()
+            };
+
+            let reuse = self.escape_cache.filter(|&(pt, tick, orig_los)| {
                 if obs.tick.saturating_sub(tick) >= 6 || dist_2d(pos, pt) <= 6.0 {
                     return false;
                 }
                 let d_zone = ((pt[0] - obs.zone.center[0]).powi(2)
                     + (pt[1] - obs.zone.center[1]).powi(2))
                 .sqrt();
-                d_zone <= safe_z_r
+                d_zone <= safe_z_r && cover_los(pt) <= orig_los
             });
-            if let Some((pt, _)) = reuse {
+            if let Some((pt, _, _)) = reuse {
                 return pt;
             }
             self.escape_cache = None;
             let esc_dir = self.belief.escape_vector(pos, obs.t);
             if let Some(cover_pt) = self.nav.find_escape_cover(
                 pos,
-                obs.me.eye_height(),
+                eye_off,
                 visible_threat_eyes,
                 esc_dir,
                 true,
@@ -523,7 +533,8 @@ impl BotBrain {
                 obs.zone.next_center,
                 obs.zone.next_radius,
             ) {
-                self.escape_cache = Some((cover_pt, obs.tick));
+                let los_now = cover_los(cover_pt);
+                self.escape_cache = Some((cover_pt, obs.tick, los_now));
                 return cover_pt;
             }
         } else {

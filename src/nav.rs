@@ -121,7 +121,8 @@ impl NavEngine {
             }
         }
 
-        let clearance = 3.1;
+        let clearance = 3.8;
+        let diag = clearance * 0.7071;
         for p in &world.prisms {
             let gx0 = (((p.min_x - clearance - world.min_x) / NAV_STEP).floor() as isize)
                 .clamp(0, nx as isize - 1) as usize;
@@ -141,7 +142,11 @@ impl NavEngine {
                         || point_in_prism_2d(cx + clearance, cy, p)
                         || point_in_prism_2d(cx - clearance, cy, p)
                         || point_in_prism_2d(cx, cy + clearance, p)
-                        || point_in_prism_2d(cx, cy - clearance, p);
+                        || point_in_prism_2d(cx, cy - clearance, p)
+                        || point_in_prism_2d(cx + diag, cy + diag, p)
+                        || point_in_prism_2d(cx + diag, cy - diag, p)
+                        || point_in_prism_2d(cx - diag, cy + diag, p)
+                        || point_in_prism_2d(cx - diag, cy - diag, p);
                     if !margin_in {
                         continue;
                     }
