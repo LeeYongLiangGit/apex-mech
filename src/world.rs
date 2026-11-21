@@ -219,7 +219,6 @@ impl World {
         radius: f64,
         height: f64,
         step_up: f64,
-        max_slope_deg: f64,
     ) -> bool {
         if nx < self.min_x + radius
             || nx > self.max_x - radius
@@ -270,29 +269,7 @@ impl World {
                 }
             }
         }
-
-        let max_slope_tan = max_slope_deg.to_radians().tan();
-        if support_z > gz + 0.05 {
-            // Prism / structure top: ledge step-up limit applies
-            if (support_z - pos[2]) > step_up {
-                return false;
-            }
-        } else {
-            // Ground terrain: enforce surface gradient and directional slope
-            let step = self.step.max(0.5);
-            let gx = (self.terrain_height(nx + step, ny) - self.terrain_height(nx - step, ny)) / (2.0 * step);
-            let gy = (self.terrain_height(nx, ny + step) - self.terrain_height(nx, ny - step)) / (2.0 * step);
-            if (gx * gx + gy * gy).sqrt() > max_slope_tan {
-                return false;
-            }
-
-            let dh = ((nx - pos[0]).powi(2) + (ny - pos[1]).powi(2)).sqrt();
-            let dz = gz - pos[2];
-            if dz > step_up && (dh <= 1e-4 || dz > dh * max_slope_tan) {
-                return false;
-            }
-        }
-        true
+        (support_z - pos[2]) <= step_up
     }
 
     /// Fast 3D raycast using 2D Amanatides–Woo DDA grid traversal + prism deduplication.

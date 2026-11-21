@@ -378,7 +378,6 @@ pub fn decide_combat(
     target: Option<&TargetInfo>,
     fallback_bearing: Option<f64>,
     last_aim: [f64; 2],
-    laser_los_lost_t: &mut Option<f64>,
     act: &mut Action,
 ) {
     let muzzle = [
@@ -387,10 +386,9 @@ pub fn decide_combat(
         obs.me.pos[2] + obs.me.muzzle_height(),
     ];
     let turn_rate = obs.me.turn_rate();
-    let cube_mult = 1.0 + cfg.cubes.damage_per_cube * (obs.me.cubes.min(cfg.cubes.stat_cap) as f64);
+    let cube_mult = 1.0 + 0.04 * (obs.me.cubes.min(cfg.cube_stat_cap) as f64);
 
     let Some(t) = target else {
-        *laser_los_lost_t = None;
         if let Some(yaw) = fallback_bearing {
             act.aim = [yaw, -0.02];
         } else {
@@ -402,37 +400,12 @@ pub fn decide_combat(
             .iter()
             .find(|s| s.as_ref().map_or(false, |w| w.kind == "gun"))
         {
-            let mag = w.stat_f64("mag", 12.0) as u32;
-            if w.reload <= 0.0 && w.ammo.unwrap_or(12) < mag {
+            if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 6 {
                 act.reload = true;
             }
         }
         return;
     };
-
-    let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
-        obs.me
-            .weapons
-            .iter()
-            .enumerate()
-            .take(2)
-            .find_map(|(i, s)| s.as_ref().filter(|w| w.kind == k).map(|w| (i, w)))
-    };
-    let lightning_slot = find_slot("lightning");
-    let laser_slot = find_slot("laser");
-    let mortar_slot = find_slot("mortar");
-    let gun_slot = find_slot("gun");
-    let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
-
-    // Trigger gun reload behind cover or when out of combat even when a 5 s memory target is still tracked
-    if !t.los || los_enemies == 0 || ceasefire_for_regen {
-        if let Some((_, g)) = gun_slot {
-            let mag = g.stat_f64("mag", 12.0) as u32;
-            if g.reload <= 0.0 && g.ammo.unwrap_or(12) < mag {
-                act.reload = true;
-            }
-        }
-    }
 
     let short_lead_pt = [
         t.pos[0] + t.vel[0] * 0.05,
@@ -455,6 +428,20 @@ pub fn decide_combat(
         return;
     }
 
+    let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
+        obs.me
+            .weapons
+            .iter()
+            .enumerate()
+            .take(2)
+            .find_map(|(i, s)| s.as_ref().filter(|w| w.kind == k).map(|w| (i, w)))
+    };
+    let lightning_slot = find_slot("lightning");
+    let laser_slot = find_slot("laser");
+    let mortar_slot = find_slot("mortar");
+    let gun_slot = find_slot("gun");
+    let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
+
     // 1. Lightning inside range (240 guaranteed DPS + chain + laser short)
     if let Some((i, w)) = lightning_slot {
         let range = w.stat_f64("range", 45.0);
@@ -470,7 +457,7 @@ pub fn decide_combat(
         }
     }
 
-    // 2. Laser: never pre-charge out of LOS, allow charging when los_enemies > 1
+    // 2. Laser: never pre-charge out of LOS, avoid 50% speed penalty under multi-bot fire
     if let Some((i, w)) = laser_slot {
         let range = w.stat_f64("range", 280.0);
         let full_charge = w.stat_f64("charge", 0.75);
@@ -483,7 +470,8 @@ pub fn decide_combat(
             && t.los
             && t.dist <= range
             && (t.dist > 45.0 || !has_close_weapon)
-            && (!urgent_dodge || t.dist > 40.0);
+            && (los_enemies <= 1 || t.has_mortar)
+            && !urgent_dodge;
 
         if w.charge > 0.0 {
             let frac = min_frac + (1.0 - min_frac) * (w.charge / full_charge).clamp(0.0, 1.0);
@@ -509,37 +497,20 @@ pub fn decide_combat(
                 || (w.charge >= min_charge && expected_dmg >= t.hp * 1.02)
                 || (w.charge >= full_charge + hold_s - 0.25);
 
-            if t.los {
-                *laser_los_lost_t = None;
-            } else if laser_los_lost_t.is_none() {
-                *laser_los_lost_t = Some(obs.t);
-            }
-
-            let los_lost_duration = laser_los_lost_t.map_or(0.0, |lost_t| obs.t - lost_t);
-            let grace_active = !t.los && los_lost_duration < 0.35;
-
             if ready && t.los && aligned && barrel_clear {
                 act.fire[i] = false;
-                *laser_los_lost_t = None;
                 return;
-            } else if w.charge >= full_charge + hold_s - 0.20
-                || (urgent_dodge && t.dist < 32.0)
-                || (!t.los && !grace_active)
-            {
-                act.fire[i] = false; // Drop charge after grace window expires or before forced discharge
-                *laser_los_lost_t = None;
+            } else if w.charge >= full_charge + hold_s - 0.20 || (urgent_dodge && t.dist < 32.0) || !t.los {
+                act.fire[i] = false; // Drop charge to regain full speed
                 return;
             } else {
-                act.fire[i] = true; // Keep charging (including during brief LOS blink within grace window)
-                return;
-            }
-        } else {
-            *laser_los_lost_t = None;
-            if w.cooldown <= 0.0 && safe_to_charge {
-                act.aim = direct_aim;
                 act.fire[i] = true;
                 return;
             }
+        } else if w.cooldown <= 0.0 && safe_to_charge {
+            act.aim = direct_aim;
+            act.fire[i] = true;
+            return;
         }
     }
 
@@ -567,7 +538,6 @@ pub fn decide_combat(
     if let Some((i, w)) = gun_slot {
         let range = w.stat_f64("range", 230.0);
         let speed = w.stat_f64("speed", 252.0);
-        let mag = w.stat_f64("mag", 12.0) as u32;
         if t.los && t.dist <= range {
             let lead = lead_aim(muzzle, t.pos, t.vel, speed, world);
             act.aim = lead;
@@ -589,14 +559,8 @@ pub fn decide_combat(
             {
                 act.fire[i] = true;
             }
-        } else if w.reload <= 0.0 {
-            if !t.los {
-                if w.ammo.unwrap_or(12) < mag {
-                    act.reload = true;
-                }
-            } else if w.ammo.unwrap_or(12) <= 5 {
-                act.reload = true;
-            }
+        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 5 {
+            act.reload = true;
         }
     }
 }

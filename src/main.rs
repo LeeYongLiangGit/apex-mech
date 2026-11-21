@@ -13,6 +13,8 @@ use std::f64::consts::PI;
 use std::io::{self, BufWriter, Write};
 use world::World;
 
+const UPGRADE_THRESHOLDS: [u32; 6] = [1, 3, 6, 10, 15, 21];
+
 struct BotBrain {
     cfg: RuleConfig,
     world: World,
@@ -20,7 +22,6 @@ struct BotBrain {
     belief: BeliefMap,
     last_aim: [f64; 2],
     last_target_id: Option<u64>,
-    laser_los_lost_t: Option<f64>,
     strafe_sign: f64,
     last_strafe_flip: u64,
     climb_stuck_ticks: u32,
@@ -39,7 +40,6 @@ impl BotBrain {
             belief: BeliefMap::new(),
             last_aim: [0.0, 0.0],
             last_target_id: None,
-            laser_los_lost_t: None,
             strafe_sign: 1.0,
             last_strafe_flip: 0,
             climb_stuck_ticks: 0,
@@ -68,11 +68,10 @@ impl BotBrain {
         if let Some(offer) = &obs.offer {
             act.pick = Some(self.pick_upgrade(offer, obs));
         }
-
-        let los_enemies = count_los_enemy_mechs(obs, &self.world);
-        self.handle_weapon_pickup(obs, los_enemies, &mut act);
+        self.handle_weapon_pickup(obs, &mut act);
 
         let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
+        let los_enemies = count_los_enemy_mechs(obs, &self.world);
         let target = select_target(
             obs,
             &self.cfg,
@@ -101,7 +100,6 @@ impl BotBrain {
             target.as_ref(),
             fallback_bearing,
             self.last_aim,
-            &mut self.laser_los_lost_t,
             &mut act,
         );
 
@@ -121,133 +119,58 @@ impl BotBrain {
     }
 
     fn pick_upgrade(&self, offer: &Offer, obs: &ObsMsg) -> usize {
-        let held_weapons: Vec<&str> = obs
-            .me
-            .weapons
-            .iter()
-            .flatten()
-            .map(|w| w.kind.as_str())
-            .collect();
+        let held_laser = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
+        let held_lightning = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
+        let held_mortar = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "mortar"));
 
         let score_choice = |c: &OfferChoice| -> f64 {
-            let def = self
-                .cfg
-                .upgrades
-                .iter()
-                .find(|u| u.id == c.id);
+            let id = c.id.to_lowercase();
+            let desc = c.desc.to_lowercase();
+            let mut s = 30.0;
 
-            let mut score = 40.0;
-
-            if let Some(d) = def {
-                let weapon_held = match &d.requires {
-                    Some(req) => held_weapons.contains(&req.as_str()),
-                    None => true,
-                };
-
-                let weapon_multiplier = if d.requires.is_some() {
-                    if weapon_held { 1.35 } else { 0.30 }
-                } else {
-                    1.0
-                };
-
-                for effect in &d.effects {
-                    let path = effect.path.as_str();
-                    let mul = effect.mul.unwrap_or(1.0);
-                    let add = effect.add.unwrap_or(0.0);
-
-                    let effect_score = match path {
-                        "mech.armor" => {
-                            let cur_armor = obs.me.stat_f64("armor", 0.0);
-                            let max_hp = obs.me.max_hp;
-                            let cur_ehp = max_hp / (1.0 - cur_armor).max(0.2);
-                            let new_ehp = max_hp / (1.0 - (cur_armor + add)).max(0.1);
-                            (new_ehp - cur_ehp).max(0.0) * 1.05
-                        }
-                        "mech.hp" => {
-                            let cur_hp = obs.me.max_hp;
-                            (cur_hp * (mul - 1.0)).max(0.0) * 0.58
-                        }
-                        "mech.walk_speed" | "mech.boost_speed" => {
-                            (mul - 1.0) * 1150.0
-                        }
-                        "mech.energy" => {
-                            add * 3.0
-                        }
-                        "mech.energy_regen" => {
-                            (mul - 1.0) * 320.0
-                        }
-                        "mech.boost_drain" | "mech.jet_drain" => {
-                            (1.0 - mul).max(0.0) * 340.0
-                        }
-                        "mech.regen_per_s" => {
-                            (mul - 1.0) * 110.0
-                        }
-                        "mech.regen_delay" => {
-                            (-add).max(0.0) * 28.0
-                        }
-                        "mech.turn_rate" | "mech.pitch_rate" => {
-                            (mul - 1.0) * 260.0
-                        }
-                        "mech.near_range_bonus" => {
-                            let factor = if self.belief.mode == MatchMode::FfaSurvival { 3.2 } else { 1.8 };
-                            add * factor
-                        }
-                        "mech.vision_bonus" => {
-                            let factor = if self.belief.mode == MatchMode::FfaSurvival { 2.4 } else { 1.4 };
-                            add * factor
-                        }
-                        "mech.hearing" => {
-                            (1.0 - mul).max(0.0) * 60.0
-                        }
-                        p if p.ends_with(".damage") => {
-                            (mul - 1.0) * 680.0
-                        }
-                        p if p.ends_with(".cooldown") => {
-                            (1.0 / mul.max(0.01) - 1.0) * 580.0
-                        }
-                        p if p.ends_with(".speed") => {
-                            (mul - 1.0) * 360.0
-                        }
-                        p if p.ends_with(".range") => {
-                            (mul - 1.0) * 380.0
-                        }
-                        p if p.ends_with(".mag") => {
-                            add * 6.5
-                        }
-                        p if p.ends_with(".reload") => {
-                            (1.0 - mul).max(0.0) * 260.0
-                        }
-                        p if p.ends_with(".charge") => {
-                            (1.0 - mul).max(0.0) * 480.0
-                        }
-                        p if p.ends_with(".pierce") => {
-                            add * 90.0
-                        }
-                        p if p.ends_with(".chain") => {
-                            add * 110.0
-                        }
-                        p if p.ends_with(".cone_deg") => {
-                            (mul - 1.0) * 400.0
-                        }
-                        p if p.ends_with(".energy") => {
-                            (1.0 - mul).max(0.0) * 300.0
-                        }
-                        p if p.ends_with(".splash_radius") => {
-                            (mul - 1.0) * 300.0
-                        }
-                        _ => 50.0,
-                    };
-
-                    score += effect_score * weapon_multiplier;
+            if let Some(arr) = self.cfg.raw_upgrades.as_array() {
+                if let Some(meta) = arr
+                    .iter()
+                    .find(|u| u.get("id").and_then(Value::as_str) == Some(c.id.as_str()))
+                {
+                    let m = meta.to_string().to_lowercase();
+                    if m.contains("armor") || m.contains("damage_mult") {
+                        s += 110.0;
+                    }
+                    if m.contains("max_hp") || m.contains("regen") {
+                        s += 102.0;
+                    }
+                    if m.contains("walk_speed") || m.contains("energy") || m.contains("boost") {
+                        s += 88.0;
+                    }
                 }
-            } else {
-                let id = c.id.to_lowercase();
-                if id.contains("armor") { score += 120.0; }
-                else if id.contains("hp") { score += 105.0; }
-                else if id.contains("speed") { score += 90.0; }
             }
 
-            score
+            if id.contains("armor") || desc.contains("damage taken") {
+                s += 120.0;
+            }
+            if id.contains("hp") || desc.contains("max hp") || desc.contains("regen") {
+                s += 105.0;
+            }
+            if id.contains("lightning") {
+                s += if held_lightning { 114.0 } else { 40.0 };
+            }
+            if id.contains("laser") {
+                s += if held_laser { 104.0 } else { 40.0 };
+            }
+            if id.contains("speed") || id.contains("energy") || id.contains("boost") {
+                s += 90.0;
+            }
+            if id.contains("sensor") || desc.contains("vision") || desc.contains("proximity") {
+                s += if self.belief.mode == MatchMode::FfaSurvival { 95.0 } else { 64.0 };
+            }
+            if id.contains("mortar") {
+                s += if held_mortar { 86.0 } else { 30.0 };
+            }
+            if id.contains("gun") {
+                s += if !held_laser && !held_lightning { 88.0 } else { 32.0 };
+            }
+            s
         };
 
         offer
@@ -282,7 +205,7 @@ impl BotBrain {
         a == "lightning" || b == "lightning" || a == "gun" || b == "gun"
     }
 
-    fn handle_weapon_pickup(&self, obs: &ObsMsg, los_enemies: usize, act: &mut Action) {
+    fn handle_weapon_pickup(&self, obs: &ObsMsg, act: &mut Action) {
         let held: Vec<Option<&str>> = obs
             .me
             .weapons
@@ -304,8 +227,7 @@ impl BotBrain {
                 if new_prio > 0 && best.map_or(true, |b| new_prio > b.0) {
                     best = Some((new_prio, p.id, None));
                 }
-            } else if los_enemies == 0 {
-                // Strictly block 1.0-1.65 s weapon swaps while exposed to LOS fire
+            } else {
                 for (slot_idx, slot) in obs.me.weapons.iter().enumerate().take(2) {
                     let Some(w) = slot else { continue };
                     if w.kind == "laser" && w.charge > 0.0 {
@@ -394,46 +316,44 @@ impl BotBrain {
         }
 
         // 3. Ground-level high-value weapon pickups (lightning / laser)
-        let next_hits_upgrade = self.cfg.cubes.upgrade_thresholds.contains(&(obs.me.cubes + 1));
+        let next_hits_upgrade = UPGRADE_THRESHOLDS.contains(&(obs.me.cubes + 1));
         let empty_slot = obs.me.weapons.iter().any(|w| w.is_none());
-        if los_enemies == 0 || empty_slot {
-            let best_pickup = obs
-                .pickups
-                .iter()
-                .filter(|p| {
-                    let already_have = obs
+        let best_pickup = obs
+            .pickups
+            .iter()
+            .filter(|p| {
+                let already_have = obs
+                    .me
+                    .weapons
+                    .iter()
+                    .any(|w| w.as_ref().map_or(false, |s| s.kind == p.kind));
+                if already_have
+                    || (p.pos[2] - pos[2]) > self.cfg.step_up + 1.5
+                    || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 6.0)
+                {
+                    return false;
+                }
+                let prio = self.weapon_priority(&p.kind, obs);
+                if empty_slot {
+                    prio >= 90
+                } else {
+                    let min_held = obs
                         .me
                         .weapons
                         .iter()
-                        .any(|w| w.as_ref().map_or(false, |s| s.kind == p.kind));
-                    if already_have
-                        || (p.pos[2] - pos[2]) > self.cfg.step_up + 1.5
-                        || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 6.0)
-                    {
-                        return false;
-                    }
-                    let prio = self.weapon_priority(&p.kind, obs);
-                    if empty_slot {
-                        prio >= 90
-                    } else {
-                        let min_held = obs
-                            .me
-                            .weapons
-                            .iter()
-                            .flatten()
-                            .map(|w| self.weapon_priority(&w.kind, obs))
-                            .min()
-                            .unwrap_or(0);
-                        prio > min_held + 15
-                    }
-                })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)));
-
-            if let Some(p) = best_pickup {
-                let max_r = if empty_slot || next_hits_upgrade { 95.0 } else { 55.0 };
-                if dist_2d(pos, p.pos) < max_r {
-                    return p.pos;
+                        .flatten()
+                        .map(|w| self.weapon_priority(&w.kind, obs))
+                        .min()
+                        .unwrap_or(0);
+                    prio > min_held + 15
                 }
+            })
+            .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)));
+
+        if let Some(p) = best_pickup {
+            let max_r = if empty_slot || next_hits_upgrade { 95.0 } else { 55.0 };
+            if dist_2d(pos, p.pos) < max_r {
+                return p.pos;
             }
         }
 
@@ -651,7 +571,6 @@ impl BotBrain {
                 radius + 0.2,
                 height,
                 self.cfg.step_up,
-                self.cfg.max_slope_deg,
             );
             let ok_far = ok_near
                 && self.world.is_walkable_step(
@@ -661,7 +580,6 @@ impl BotBrain {
                     radius + 0.2,
                     height,
                     self.cfg.step_up,
-                    self.cfg.max_slope_deg,
                 );
 
             let mut score = if ok_far {
@@ -755,7 +673,6 @@ impl BotBrain {
             radius + 0.2,
             height,
             self.cfg.step_up,
-            self.cfg.max_slope_deg,
         ) {
             self.strafe_sign = -self.strafe_sign;
             self.last_strafe_flip = obs.tick;
