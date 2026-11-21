@@ -10,7 +10,7 @@ pub struct Waypoint {
     pub x: f64,
     pub y: f64,
     pub z: f64,
-    pub layer: usize, // 0 = ground, 1 = roof/bridge deck
+    pub layer: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +109,6 @@ impl NavEngine {
             }
         }
 
-        // 3.1 m clearance keeps scaled mechs out of narrow wall snags
         let clearance = 3.1;
         for p in &world.prisms {
             let gx0 = (((p.min_x - clearance - world.min_x) / NAV_STEP).floor() as isize)
@@ -189,6 +188,10 @@ impl NavEngine {
             cached_path: Vec::new(),
             last_plan_tick: 0,
         }
+    }
+
+    pub fn invalidate_cache(&mut self) {
+        self.cached_path.clear();
     }
 
     #[inline]
@@ -285,8 +288,8 @@ impl NavEngine {
             + (goal[2] - self.cached_goal[2]).powi(2))
         .sqrt();
         let need_replan = self.cached_path.is_empty()
-            || tick.saturating_sub(self.last_plan_tick) >= 6
-            || goal_shift > 10.0;
+            || tick.saturating_sub(self.last_plan_tick) >= 8
+            || goal_shift > 12.0;
 
         if need_replan {
             self.cached_path = self.find_path(pos, goal, allow_jet);
@@ -367,7 +370,7 @@ impl NavEngine {
         let mut best_idx = start_idx;
         let mut best_h = heuristic(sx, sy);
         let mut expansions = 0_usize;
-        const MAX_EXPANSIONS: usize = 2000;
+        const MAX_EXPANSIONS: usize = 1200;
 
         const DIRS: [(isize, isize, f32); 8] = [
             (1, 0, 4.0),
@@ -418,7 +421,7 @@ impl NavEngine {
                     let step_cost = if dz <= self.step_up {
                         if cl == 1 && nl == 0 { dist + 2.0 } else { dist }
                     } else if allow_jet && nl == 1 && dz <= MAX_CLIMB_M as f32 {
-                        dist + 22.0 + dz * 1.8
+                        dist + 20.0 + dz * 1.6
                     } else {
                         continue;
                     };
@@ -431,7 +434,7 @@ impl NavEngine {
                         self.g_score[nidx] = ng;
                         self.parent[nidx] = idx as u32;
                         open.push(OpenNode {
-                            f: ng + heuristic(ux, uy) * 1.15,
+                            f: ng + heuristic(ux, uy) * 1.2,
                             idx: nidx,
                         });
                     }
@@ -462,6 +465,116 @@ impl NavEngine {
             rev.remove(0);
         }
         rev
+    }
+
+    /// Searches nearby building corners and climbable rooftops (12–56 m) for a true
+    /// LOS-breaking cover spot (0-LOS for regen or 1-LOS for 1v1 isolation).
+    pub fn find_escape_cover(
+        &self,
+        pos: [f64; 3],
+        my_eye_off: f64,
+        threat_eyes: &[[f64; 3]],
+        escape_dir: [f64; 2],
+        want_zero_los: bool,
+        allow_roof: bool,
+        world: &World,
+        zone_center: [f64; 2],
+        zone_radius: f64,
+    ) -> Option<[f64; 3]> {
+        if threat_eyes.is_empty() {
+            return None;
+        }
+        let (cgx, cgy) = self.world_to_grid(pos[0], pos[1]);
+        let r_cells = 14_isize; // 56 m radius
+        let safe_r = (zone_radius - 10.0).max(6.0);
+
+        let mut best: Option<(f64, [f64; 3])> = None;
+        let mut checked = 0_usize;
+
+        for dy in (-r_cells..=r_cells).step_by(3) {
+            let ny = cgy as isize + dy;
+            if ny <= 1 || ny >= (self.ny as isize - 1) {
+                continue;
+            }
+            for dx in (-r_cells..=r_cells).step_by(3) {
+                let nx = cgx as isize + dx;
+                if nx <= 1 || nx >= (self.nx as isize - 1) {
+                    continue;
+                }
+                let (ux, uy) = (nx as usize, ny as usize);
+                let c = self.cells[uy * self.nx + ux];
+                let use_roof = allow_roof
+                    && c.roof_z.is_finite()
+                    && (c.roof_z as f64 - pos[2]) > 4.0
+                    && (c.roof_z as f64 - pos[2]) <= 28.0;
+                if !c.near_cover && !use_roof {
+                    continue;
+                }
+                if !use_roof && c.blocked_ground {
+                    continue;
+                }
+
+                let (wx, wy) = self.grid_to_world(ux, uy);
+                let dist_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();
+                if !(10.0..=56.0).contains(&dist_me) {
+                    continue;
+                }
+                let dist_z = ((wx - zone_center[0]).powi(2) + (wy - zone_center[1]).powi(2)).sqrt();
+                if dist_z > safe_r {
+                    continue;
+                }
+
+                checked += 1;
+                if checked > 28 {
+                    return best.map(|(_, p)| p);
+                }
+
+                let wz = if use_roof {
+                    c.roof_z as f64
+                } else {
+                    c.ground_z as f64
+                };
+                let cand_eye = [wx, wy, wz + my_eye_off];
+
+                let mut los_count = 0_usize;
+                let mut min_threat_d = f64::INFINITY;
+                for &te in threat_eyes {
+                    let td = ((wx - te[0]).powi(2) + (wy - te[1]).powi(2)).sqrt();
+                    min_threat_d = min_threat_d.min(td);
+                    if world.raycast_solid(te, cand_eye).is_none() {
+                        los_count += 1;
+                    }
+                }
+
+                let mut score = if want_zero_los {
+                    if los_count == 0 {
+                        220.0
+                    } else {
+                        -(los_count as f64) * 110.0
+                    }
+                } else if los_count == 1 {
+                    185.0 // Clean 1v1 isolation!
+                } else if los_count == 0 {
+                    145.0
+                } else {
+                    -(los_count as f64) * 90.0
+                };
+
+                // Prefer spots away from the threat cluster & reachable quickly
+                let dir_dot = ((wx - pos[0]) * escape_dir[0] + (wy - pos[1]) * escape_dir[1]) / dist_me;
+                score += dir_dot * 45.0;
+                score += min_threat_d.min(85.0) * 1.1;
+                score -= dist_me * 1.3;
+                if use_roof {
+                    score += 35.0;
+                }
+
+                if best.map_or(true, |(bs, _)| score > bs) {
+                    best = Some((score, [wx, wy, wz]));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
     }
 
     pub fn find_safe_rooftop(
@@ -497,7 +610,7 @@ impl NavEngine {
                     continue;
                 }
                 let climb = (c.roof_z as f64 - c.ground_z as f64).max(0.0);
-                if !(5.0..=32.0).contains(&climb) {
+                if !(5.0..=30.0).contains(&climb) {
                     continue;
                 }
                 let d_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();

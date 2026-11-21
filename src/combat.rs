@@ -1,13 +1,7 @@
+use crate::belief::MatchMode;
 use crate::protocol::*;
 use crate::world::World;
 use std::f64::consts::PI;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    Unknown,
-    PracticeHivemind,
-    FfaSurvival,
-}
 
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
@@ -63,7 +57,6 @@ pub fn aim_dir(aim: [f64; 2]) -> [f64; 3] {
     [cp * aim[0].cos(), cp * aim[0].sin(), aim[1].sin()]
 }
 
-/// Predicts actual torso aim after 1 sim tick (0.05 s) of slewing toward `desired`.
 fn predict_aim_after_step(cur: [f64; 2], desired: [f64; 2], turn_rate: f64) -> [f64; 2] {
     let max_step = turn_rate * 0.05;
     let dy = angle_diff(cur[0], desired[0]).clamp(-max_step, max_step);
@@ -71,7 +64,6 @@ fn predict_aim_after_step(cur: [f64; 2], desired: [f64; 2], turn_rate: f64) -> [
     [cur[0] + dy, cur[1] + dp]
 }
 
-/// 3D gun lead solver with 0.05 s half-tick compensation and wall clamping.
 pub fn lead_aim(
     from: [f64; 3],
     target_pos: [f64; 3],
@@ -102,7 +94,6 @@ pub fn lead_aim(
     aim_to(from, pred)
 }
 
-/// Dual-arc parabolic mortar solver (fast low arc, then high lob over buildings).
 pub fn solve_mortar(
     obs: &ObsMsg,
     cfg: &RuleConfig,
@@ -191,7 +182,7 @@ pub fn solve_mortar(
         let v0 = [dir[0] * speed, dir[1] * speed, dir[2] * speed];
         let mut prev = start;
         let mut clear = true;
-        const SEGMENTS: usize = 10;
+        const SEGMENTS: usize = 8;
         for s in 1..=SEGMENTS {
             let t = (s as f64 / SEGMENTS as f64) * flight_t * 0.94;
             let cur = [
@@ -212,7 +203,6 @@ pub fn solve_mortar(
     None
 }
 
-/// Counts visible enemy mechs that currently have clear LOS to us.
 pub fn count_los_enemy_mechs(obs: &ObsMsg, world: &World) -> usize {
     let my_eye = [
         obs.me.pos[0],
@@ -226,10 +216,8 @@ pub fn count_los_enemy_mechs(obs: &ObsMsg, world: &World) -> usize {
                 return false;
             }
             let h = 9.0 * (1.0 + 0.05 * m.cubes as f64);
-            let e_mid = [m.pos[0], m.pos[1], m.pos[2] + 0.5 * h];
-            let e_top = [m.pos[0], m.pos[1], m.pos[2] + 0.8 * h];
+            let e_mid = [m.pos[0], m.pos[1], m.pos[2] + 0.55 * h];
             world.raycast_solid(my_eye, e_mid).is_none()
-                || world.raycast_solid(my_eye, e_top).is_none()
         })
         .count()
 }
@@ -239,6 +227,7 @@ pub fn select_target(
     cfg: &RuleConfig,
     world: &World,
     mode: MatchMode,
+    prev_target_id: Option<u64>,
 ) -> Option<TargetInfo> {
     let muzzle = [
         obs.me.pos[0],
@@ -292,20 +281,23 @@ pub fn select_target(
         let bearing_from_enemy = (obs.me.pos[1] - m.pos[1]).atan2(obs.me.pos[0] - m.pos[0]);
         let rear_exposed = angle_diff(m.aim[0], bearing_from_enemy).abs() > PI * 0.52;
 
-        // Strong focus-fire bias on closest & lowest-HP mech to reduce incoming DPS fast
         let mut score = if is_mech { 1050.0 } else { 440.0 } - d * 2.6;
-        score += (1400.0 - hp).max(0.0) * 0.85;
+        score += (1400.0 - hp).max(0.0) * 0.90;
         if is_mech && hp <= 420.0 {
-            score += 260.0; // Finish kills!
+            score += 290.0;
+        }
+        // Kill-focus hysteresis: finish our current mech target before switching
+        if prev_target_id == Some(m.id as u64) && los {
+            score += 130.0;
         }
         if has_lightning && d <= 44.0 && los {
-            score += 220.0;
+            score += 240.0;
         }
         if rear_exposed && is_mech {
             score += 170.0;
         }
         if m.charging {
-            score += if has_lightning && d <= 45.0 { 450.0 } else { 200.0 };
+            score += if has_lightning && d <= 45.0 { 460.0 } else { 200.0 };
         }
         if has_laser && enemy_mortar && los {
             score += 210.0;
@@ -313,7 +305,6 @@ pub fn select_target(
         if !los {
             score -= if has_mortar && d <= 200.0 { 160.0 } else { 520.0 };
         }
-
         if mode == MatchMode::FfaSurvival && is_mech && d > 85.0 && hp > 950.0 && !rear_exposed {
             score -= 360.0;
         }
@@ -339,7 +330,6 @@ pub fn select_target(
         }
     }
 
-    // Farm crates whenever below stat cap and not actively under close mech LOS fire
     let want_crates = obs.me.cubes < cfg.cube_stat_cap;
     let active_mech_fight = best
         .as_ref()
@@ -351,7 +341,7 @@ pub fn select_target(
             if d > 55.0 || world.raycast_solid(muzzle, pt).is_some() {
                 continue;
             }
-            let score = 680.0 - d * 3.5 + (300.0 - c.hp) * 0.5;
+            let score = 700.0 - d * 3.5 + (300.0 - c.hp) * 0.5;
             if best.as_ref().map_or(true, |b| score > b.score) {
                 best = Some(TargetInfo {
                     id: c.id,
@@ -374,7 +364,6 @@ pub fn select_target(
     best
 }
 
-/// Arbitrates cleanly among held weapons so only ONE weapon drives `act.aim` per tick.
 pub fn decide_combat(
     obs: &ObsMsg,
     cfg: &RuleConfig,
@@ -399,10 +388,14 @@ pub fn decide_combat(
         if let Some(yaw) = fallback_bearing {
             act.aim = [yaw, -0.02];
         } else {
-            act.aim = [last_aim[0] + 0.14, -0.02];
+            act.aim = [last_aim[0] + 0.16, -0.02];
         }
-        // Reload gun proactively when unengaged
-        if let Some(Some(w)) = obs.me.weapons.iter().find(|s| s.as_ref().map_or(false, |w| w.kind == "gun")) {
+        if let Some(Some(w)) = obs
+            .me
+            .weapons
+            .iter()
+            .find(|s| s.as_ref().map_or(false, |w| w.kind == "gun"))
+        {
             if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 6 {
                 act.reload = true;
             }
@@ -410,7 +403,6 @@ pub fn decide_combat(
         return;
     };
 
-    // Always face primary target to protect our 180° front armor (avoid 1.5x rear dmg)
     let short_lead_pt = [
         t.pos[0] + t.vel[0] * 0.05,
         t.pos[1] + t.vel[1] * 0.05,
@@ -419,12 +411,10 @@ pub fn decide_combat(
     let direct_aim = aim_to(muzzle, short_lead_pt);
     act.aim = direct_aim;
 
-    // ONLY hold fire for regen if we are truly safe (ceasefire_for_regen requires 0 LOS enemies!)
     if ceasefire_for_regen && (!t.los || !t.is_mech) {
         return;
     }
 
-    // In FFA, avoid poking healthy far enemies unless rear-exposed or endgame
     let ffa_hold = mode == MatchMode::FfaSurvival
         && t.is_mech
         && t.dist > 95.0
@@ -434,7 +424,6 @@ pub fn decide_combat(
         return;
     }
 
-    // Find slot indices of each weapon kind
     let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
         obs.me
             .weapons
@@ -447,10 +436,9 @@ pub fn decide_combat(
     let laser_slot = find_slot("laser");
     let mortar_slot = find_slot("mortar");
     let gun_slot = find_slot("gun");
-
     let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
 
-    // 1. PRIORITY 1: Lightning inside range (240 guaranteed DPS, AoE chain, shorts enemy lasers!)
+    // 1. Lightning inside range (240 guaranteed DPS + AoE chain + enemy laser interrupt)
     if let Some((i, w)) = lightning_slot {
         let range = w.stat_f64("range", 45.0);
         let cone = w.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
@@ -461,12 +449,11 @@ pub fn decide_combat(
             if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
                 act.fire[i] = true;
             }
-            // Don't start charging laser while shredding with lightning
             return;
         }
     }
 
-    // 2. PRIORITY 2: Laser (if already charging, OR at mid/long range where 50% speed penalty is safe)
+    // 2. Laser (pre-charge behind corners on close wallhacked targets, or mid/long range burst)
     if let Some((i, w)) = laser_slot {
         let range = w.stat_f64("range", 280.0);
         let full_charge = w.stat_f64("charge", 0.75);
@@ -477,7 +464,7 @@ pub fn decide_combat(
 
         let safe_to_charge = !t.is_crate
             && t.dist <= range
-            && (t.dist > 34.0 || !has_close_weapon)
+            && (t.dist > 34.0 || !has_close_weapon || !t.los)
             && !urgent_dodge;
 
         if w.charge > 0.0 {
@@ -486,12 +473,13 @@ pub fn decide_combat(
             let expected_dmg = base_dmg * frac * cook_mult * cube_mult;
 
             act.aim = direct_aim;
-            let yaw_err = angle_diff(obs.me.aim[0], direct_aim[0]).abs();
-            let pitch_err = (obs.me.aim[1] - direct_aim[1]).abs();
-            let hit_tol = (2.6 / t.dist.max(8.0)).clamp(0.035, 0.16);
+            let pred = predict_aim_after_step(obs.me.aim, direct_aim, turn_rate);
+            let yaw_err = angle_diff(pred[0], direct_aim[0]).abs();
+            let pitch_err = (pred[1] - direct_aim[1]).abs();
+            let hit_tol = (2.8 / t.dist.max(8.0)).clamp(0.038, 0.18);
             let aligned = yaw_err <= hit_tol && pitch_err <= hit_tol;
 
-            let dir = aim_dir(obs.me.aim);
+            let dir = aim_dir(pred);
             let barrel_tip = [
                 muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
                 muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
@@ -499,28 +487,31 @@ pub fn decide_combat(
             ];
             let barrel_clear = world.raycast_solid(muzzle, barrel_tip).is_none();
 
-            let ready = w.charge >= full_charge - 0.04
+            let ready = w.charge >= full_charge - 0.05
                 || (w.charge >= min_charge && expected_dmg >= t.hp * 1.02)
                 || (w.charge >= full_charge + hold_s - 0.25);
 
             if ready && t.los && aligned && barrel_clear {
-                act.fire[i] = false; // Release fires hitscan laser on target!
+                act.fire[i] = false; // Release fires hitscan laser!
                 return;
             } else if w.charge >= full_charge + hold_s - 0.20 || (urgent_dodge && t.dist < 25.0) {
-                act.fire[i] = false; // Release to regain sprint speed
+                act.fire[i] = false;
                 return;
             } else {
-                act.fire[i] = true; // Keep holding charge while slewing onto target
+                act.fire[i] = true;
                 return;
             }
-        } else if w.cooldown <= 0.0 && safe_to_charge && t.los {
-            act.aim = direct_aim;
-            act.fire[i] = true;
-            return;
+        } else if w.cooldown <= 0.0 && safe_to_charge {
+            // Start charging in LOS, or pre-charge behind cover when a mech is within 52 m
+            if t.los || (t.is_mech && t.dist < 52.0 && !ceasefire_for_regen) {
+                act.aim = direct_aim;
+                act.fire[i] = true;
+                return;
+            }
         }
     }
 
-    // 3. PRIORITY 3: Dual-Arc Mortar (hidden 5s-tracked mechs, lightning rushers, or gun reloading)
+    // 3. Dual-arc Mortar
     if let Some((i, w)) = mortar_slot {
         let gun_ready = gun_slot.map_or(false, |(_, g)| g.reload <= 0.0 && t.los && t.dist < 140.0);
         let want_mortar = !t.is_crate
@@ -540,7 +531,7 @@ pub fn decide_combat(
         }
     }
 
-    // 4. PRIORITY 4: Arm Gun (3D lead + predicted-slew gating + smart reload)
+    // 4. Arm Gun (3D lead + predicted-slew gating + cover reload)
     if let Some((i, w)) = gun_slot {
         let range = w.stat_f64("range", 230.0);
         let speed = w.stat_f64("speed", 252.0);
@@ -552,7 +543,7 @@ pub fn decide_combat(
             let pitch_err = (pred[1] - lead[1]).abs();
             let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
 
-            let dir = aim_dir(obs.me.aim);
+            let dir = aim_dir(pred);
             let barrel_tip = [
                 muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
                 muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
@@ -565,7 +556,7 @@ pub fn decide_combat(
             {
                 act.fire[i] = true;
             }
-        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 4 {
+        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 6 {
             act.reload = true;
         }
     }
@@ -583,8 +574,8 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             let g = cfg.mortar_gravity;
             let mut cur = p.pos;
             let mut vel = p.vel;
-            let dt = 0.06;
-            for step in 1..=55 {
+            let dt = 0.08;
+            for step in 1..=40 {
                 let next = [
                     cur[0] + vel[0] * dt,
                     cur[1] + vel[1] * dt,
@@ -592,7 +583,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                 ];
                 vel[2] -= g * dt;
                 let hit = next[2] <= world.terrain_height(next[0], next[1]) + 0.2
-                    || (step % 2 == 0 && world.raycast_solid(cur, next).is_some());
+                    || (step % 4 == 0 && world.raycast_solid(cur, next).is_some());
                 cur = next;
                 if hit {
                     let t_imp = step as f64 * dt;
@@ -644,7 +635,6 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
         }
     }
 
-    // Dodge out of enemy charging laser sightlines
     for m in &obs.mechs {
         if m.kind != "mech" || !m.charging {
             continue;

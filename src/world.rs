@@ -73,6 +73,7 @@ pub struct World {
     pub nx: usize,
     pub ny: usize,
     heights: Vec<f32>,
+    max_terrain_z: f64,
     pub prisms: Vec<Prism>,
     pub trees: Vec<Tree>,
     grid_nx: usize,
@@ -82,14 +83,7 @@ pub struct World {
 
 impl World {
     pub fn load(map_dir: &str, files: &[String]) -> Result<Self, String> {
-        // Strip Windows drive letter (e.g. C:\arena -> \arena) if running inside Linux container
-        let clean_dir = if !cfg!(windows) && map_dir.len() >= 2 && map_dir.as_bytes()[1] == b':' {
-            &map_dir[2..]
-        } else {
-            map_dir
-        };
-        let normalized = clean_dir.replace('\\', "/");
-        let base = Path::new(&normalized);
+        let base = Path::new(map_dir);
         let world_rel = files
             .iter()
             .find(|f| f.ends_with("world.json"))
@@ -113,9 +107,14 @@ impl World {
             return Err("terrain.i16 shorter than expected".into());
         }
         let mut heights = Vec::with_capacity(expected);
+        let mut max_terrain_z = f64::NEG_INFINITY;
         for chunk in terrain_bytes[..expected * 2].chunks_exact(2) {
             let cm = i16::from_le_bytes([chunk[0], chunk[1]]);
-            heights.push(cm as f32 * 0.01);
+            let h = cm as f32 * 0.01;
+            if (h as f64) > max_terrain_z {
+                max_terrain_z = h as f64;
+            }
+            heights.push(h);
         }
 
         let min_x = wj.terrain.min_x;
@@ -145,10 +144,14 @@ impl World {
             }
             let holes = rp.holes.iter().map(|h| flat_to_pts(h)).collect();
             let idx = prisms.len() as u32;
-            let gx0 = (((p_min_x - min_x) / CELL_SIZE).floor() as isize).clamp(0, grid_nx as isize - 1) as usize;
-            let gx1 = (((p_max_x - min_x) / CELL_SIZE).floor() as isize).clamp(0, grid_nx as isize - 1) as usize;
-            let gy0 = (((p_min_y - min_y) / CELL_SIZE).floor() as isize).clamp(0, grid_ny as isize - 1) as usize;
-            let gy1 = (((p_max_y - min_y) / CELL_SIZE).floor() as isize).clamp(0, grid_ny as isize - 1) as usize;
+            let gx0 = (((p_min_x - min_x) / CELL_SIZE).floor() as isize)
+                .clamp(0, grid_nx as isize - 1) as usize;
+            let gx1 = (((p_max_x - min_x) / CELL_SIZE).floor() as isize)
+                .clamp(0, grid_nx as isize - 1) as usize;
+            let gy0 = (((p_min_y - min_y) / CELL_SIZE).floor() as isize)
+                .clamp(0, grid_ny as isize - 1) as usize;
+            let gy1 = (((p_max_y - min_y) / CELL_SIZE).floor() as isize)
+                .clamp(0, grid_ny as isize - 1) as usize;
             for gy in gy0..=gy1 {
                 for gx in gx0..=gx1 {
                     grid[gy * grid_nx + gx].push(idx);
@@ -178,6 +181,7 @@ impl World {
             nx: wj.terrain.nx,
             ny: wj.terrain.ny,
             heights,
+            max_terrain_z,
             prisms,
             trees,
             grid_nx,
@@ -186,7 +190,7 @@ impl World {
         })
     }
 
-    /// Bilinear terrain height sampling per protocol §11.
+    #[inline]
     pub fn terrain_height(&self, x: f64, y: f64) -> f64 {
         let fx = ((x - self.min_x) / self.step).clamp(0.0, (self.nx - 1) as f64);
         let fy = ((y - self.min_y) / self.step).clamp(0.0, (self.ny - 1) as f64);
@@ -207,28 +211,45 @@ impl World {
         hx0 + (hx1 - hx0) * ty
     }
 
-    /// Checks whether a horizontal step from `pos` to `(nx, ny)` is unobstructed
-    /// at current foot height (respecting `step_up`, bridges, and walls).
-    pub fn is_walkable_step(&self, pos: [f64; 3], nx: f64, ny: f64, radius: f64, height: f64, step_up: f64) -> bool {
-        if nx < self.min_x + radius || nx > self.max_x - radius || ny < self.min_y + radius || ny > self.max_y - radius {
+    pub fn is_walkable_step(
+        &self,
+        pos: [f64; 3],
+        nx: f64,
+        ny: f64,
+        radius: f64,
+        height: f64,
+        step_up: f64,
+    ) -> bool {
+        if nx < self.min_x + radius
+            || nx > self.max_x - radius
+            || ny < self.min_y + radius
+            || ny > self.max_y - radius
+        {
             return false;
         }
         let gz = self.terrain_height(nx, ny);
         let mut support_z = gz;
 
-        let gx0 = (((nx - radius - self.min_x) / CELL_SIZE).floor() as isize).clamp(0, self.grid_nx as isize - 1) as usize;
-        let gx1 = (((nx + radius - self.min_x) / CELL_SIZE).floor() as isize).clamp(0, self.grid_nx as isize - 1) as usize;
-        let gy0 = (((ny - radius - self.min_y) / CELL_SIZE).floor() as isize).clamp(0, self.grid_ny as isize - 1) as usize;
-        let gy1 = (((ny + radius - self.min_y) / CELL_SIZE).floor() as isize).clamp(0, self.grid_ny as isize - 1) as usize;
+        let gx0 = (((nx - radius - self.min_x) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_nx as isize - 1) as usize;
+        let gx1 = (((nx + radius - self.min_x) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_nx as isize - 1) as usize;
+        let gy0 = (((ny - radius - self.min_y) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_ny as isize - 1) as usize;
+        let gy1 = (((ny + radius - self.min_y) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_ny as isize - 1) as usize;
 
         for gy in gy0..=gy1 {
             for gx in gx0..=gx1 {
                 for &pid in &self.grid[gy * self.grid_nx + gx] {
                     let p = &self.prisms[pid as usize];
-                    if nx + radius < p.min_x || nx - radius > p.max_x || ny + radius < p.min_y || ny - radius > p.max_y {
+                    if nx + radius < p.min_x
+                        || nx - radius > p.max_x
+                        || ny + radius < p.min_y
+                        || ny - radius > p.max_y
+                    {
                         continue;
                     }
-                    // Check center + 4 cardinal offsets around the mech cylinder.
                     let overlaps = point_in_prism_2d(nx, ny, p)
                         || point_in_prism_2d(nx + radius, ny, p)
                         || point_in_prism_2d(nx - radius, ny, p)
@@ -237,16 +258,13 @@ impl World {
                     if !overlaps {
                         continue;
                     }
-                    // Standing on top of this roof/bridge
                     if p.top <= pos[2] + step_up && p.top > support_z {
                         support_z = p.top;
                         continue;
                     }
-                    // Passing under a bridge or overhang: require full head clearance
                     if p.base >= pos[2] + height {
                         continue;
                     }
-                    // Otherwise solid wall / low overhang blocks movement
                     return false;
                 }
             }
@@ -254,57 +272,125 @@ impl World {
         (support_z - pos[2]) <= step_up
     }
 
-    /// Exact 3D line-of-sight / shot-blocking test against solid prisms & terrain.
-    /// Returns `Some(t)` in `[0.0, 1.0]` for the closest hit, or `None` if clear.
+    /// Fast 3D raycast using 2D Amanatides–Woo DDA grid traversal + prism deduplication.
+    /// Returns `Some(t)` in `[0.0, 1.0]` for the closest hit, or `None` if unobstructed.
     pub fn raycast_solid(&self, origin: [f64; 3], target: [f64; 3]) -> Option<f64> {
-        let dir = [target[0] - origin[0], target[1] - origin[1], target[2] - origin[2]];
-        let dist = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-        if dist < 1e-6 {
+        let dir = [
+            target[0] - origin[0],
+            target[1] - origin[1],
+            target[2] - origin[2],
+        ];
+        let dist_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        if dist_sq < 1e-12 {
             return None;
         }
+        let dist = dist_sq.sqrt();
 
         let mut best_t = 1.000_001_f64;
         let mut hit = false;
 
-        // 1. Check prisms along the 2D bounding corridor (fast grid scan)
-        let min_x = origin[0].min(target[0]);
-        let max_x = origin[0].max(target[0]);
-        let min_y = origin[1].min(target[1]);
-        let max_y = origin[1].max(target[1]);
+        // Stack-allocated dedup buffer so multi-cell prisms are tested only once
+        let mut seen = [u32::MAX; 32];
+        let mut seen_len = 0_usize;
 
-        let gx0 = (((min_x - self.min_x) / CELL_SIZE).floor() as isize).clamp(0, self.grid_nx as isize - 1) as usize;
-        let gx1 = (((max_x - self.min_x) / CELL_SIZE).floor() as isize).clamp(0, self.grid_nx as isize - 1) as usize;
-        let gy0 = (((min_y - self.min_y) / CELL_SIZE).floor() as isize).clamp(0, self.grid_ny as isize - 1) as usize;
-        let gy1 = (((max_y - self.min_y) / CELL_SIZE).floor() as isize).clamp(0, self.grid_ny as isize - 1) as usize;
+        // 2D DDA over the 16 m spatial hash
+        let fx = (origin[0] - self.min_x) / CELL_SIZE;
+        let fy = (origin[1] - self.min_y) / CELL_SIZE;
+        let mut cx = (fx.floor() as isize).clamp(0, self.grid_nx as isize - 1);
+        let mut cy = (fy.floor() as isize).clamp(0, self.grid_ny as isize - 1);
 
-        for gy in gy0..=gy1 {
-            for gx in gx0..=gx1 {
-                // Quick 2D slab skip per cell
-                let cx0 = self.min_x + gx as f64 * CELL_SIZE;
-                let cy0 = self.min_y + gy as f64 * CELL_SIZE;
-                if !ray_hits_aabb_2d(origin[0], origin[1], dir[0], dir[1], cx0, cx0 + CELL_SIZE, cy0, cy0 + CELL_SIZE, best_t) {
+        let end_cx = (((target[0] - self.min_x) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_nx as isize - 1);
+        let end_cy = (((target[1] - self.min_y) / CELL_SIZE).floor() as isize)
+            .clamp(0, self.grid_ny as isize - 1);
+
+        let step_x: isize = if dir[0] > 1e-9 { 1 } else if dir[0] < -1e-9 { -1 } else { 0 };
+        let step_y: isize = if dir[1] > 1e-9 { 1 } else if dir[1] < -1e-9 { -1 } else { 0 };
+
+        let t_delta_x = if step_x != 0 {
+            (CELL_SIZE / dir[0]).abs()
+        } else {
+            f64::INFINITY
+        };
+        let t_delta_y = if step_y != 0 {
+            (CELL_SIZE / dir[1]).abs()
+        } else {
+            f64::INFINITY
+        };
+
+        let mut t_max_x = if step_x > 0 {
+            ((cx + 1) as f64 * CELL_SIZE + self.min_x - origin[0]) / dir[0]
+        } else if step_x < 0 {
+            (cx as f64 * CELL_SIZE + self.min_x - origin[0]) / dir[0]
+        } else {
+            f64::INFINITY
+        };
+        let mut t_max_y = if step_y > 0 {
+            ((cy + 1) as f64 * CELL_SIZE + self.min_y - origin[1]) / dir[1]
+        } else if step_y < 0 {
+            (cy as f64 * CELL_SIZE + self.min_y - origin[1]) / dir[1]
+        } else {
+            f64::INFINITY
+        };
+        if t_max_x < 0.0 {
+            t_max_x = 0.0;
+        }
+        if t_max_y < 0.0 {
+            t_max_y = 0.0;
+        }
+
+        let max_steps = (end_cx - cx).unsigned_abs() + (end_cy - cy).unsigned_abs() + 2;
+        let mut t_enter = 0.0_f64;
+
+        for _ in 0..max_steps {
+            if t_enter >= best_t {
+                break;
+            }
+            let cell = &self.grid[cy as usize * self.grid_nx + cx as usize];
+            for &pid in cell {
+                if seen[..seen_len].contains(&pid) {
                     continue;
                 }
-                for &pid in &self.grid[gy * self.grid_nx + gx] {
-                    if let Some(t) = ray_hits_prism(origin, dir, best_t, &self.prisms[pid as usize]) {
-                        best_t = t;
-                        hit = true;
-                    }
+                if seen_len < seen.len() {
+                    seen[seen_len] = pid;
+                    seen_len += 1;
                 }
+                if let Some(t) = ray_hits_prism(origin, dir, best_t, &self.prisms[pid as usize]) {
+                    best_t = t;
+                    hit = true;
+                }
+            }
+            if cx == end_cx && cy == end_cy {
+                break;
+            }
+            if t_max_x < t_max_y {
+                t_enter = t_max_x;
+                t_max_x += t_delta_x;
+                cx += step_x;
+            } else {
+                t_enter = t_max_y;
+                t_max_y += t_delta_y;
+                cy += step_y;
+            }
+            if cx < 0 || cy < 0 || cx >= self.grid_nx as isize || cy >= self.grid_ny as isize {
+                break;
             }
         }
 
-        // 2. Terrain height march (2 m steps)
-        let steps = ((dist * best_t.min(1.0)) / 2.0).ceil().max(1.0) as usize;
-        for s in 1..=steps {
-            let t = (s as f64 / steps as f64) * best_t.min(1.0);
-            let px = origin[0] + dir[0] * t;
-            let py = origin[1] + dir[1] * t;
-            let pz = origin[2] + dir[2] * t;
-            if pz <= self.terrain_height(px, py) - 0.05 {
-                best_t = t;
-                hit = true;
-                break;
+        // Fast terrain check (skip completely if both ends are above max campus terrain height)
+        if origin[2].min(target[2]) <= self.max_terrain_z + 0.1 {
+            let max_seg = dist * best_t.min(1.0);
+            let steps = (max_seg / 4.0).ceil().max(1.0) as usize;
+            for s in 1..=steps {
+                let t = (s as f64 / steps as f64) * best_t.min(1.0);
+                let px = origin[0] + dir[0] * t;
+                let py = origin[1] + dir[1] * t;
+                let pz = origin[2] + dir[2] * t;
+                if pz <= self.terrain_height(px, py) - 0.05 {
+                    best_t = t;
+                    hit = true;
+                    break;
+                }
             }
         }
 
@@ -376,7 +462,17 @@ pub fn point_in_prism_2d(x: f64, y: f64, p: &Prism) -> bool {
     true
 }
 
-fn ray_hits_aabb_2d(ox: f64, oy: f64, dx: f64, dy: f64, min_x: f64, max_x: f64, min_y: f64, max_y: f64, t_max: f64) -> bool {
+fn ray_hits_aabb_2d(
+    ox: f64,
+    oy: f64,
+    dx: f64,
+    dy: f64,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    t_max: f64,
+) -> bool {
     let mut t0 = 0.0_f64;
     let mut t1 = t_max;
     for &(o, d, lo, hi) in &[(ox, dx, min_x, max_x), (oy, dy, min_y, max_y)] {
@@ -421,7 +517,6 @@ fn ray_hits_prism(o: [f64; 3], d: [f64; 3], max_t: f64, p: &Prism) -> Option<f64
         }
     };
 
-    // Horizontal roof & bridge underside caps
     if d[2].abs() > 1e-9 {
         for &z_plane in &[p.top, p.base] {
             let t = (z_plane - o[2]) / d[2];
@@ -435,7 +530,6 @@ fn ray_hits_prism(o: [f64; 3], d: [f64; 3], max_t: f64, p: &Prism) -> Option<f64
         }
     }
 
-    // Vertical wall edges of outer ring and any inner holes
     let check_edges = |ring: &[[f64; 2]], update: &mut dyn FnMut(f64)| {
         let n = ring.len();
         for i in 0..n {
