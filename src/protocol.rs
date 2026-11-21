@@ -323,8 +323,34 @@ impl Action {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpgradeEffect {
+    pub path: String,
+    #[serde(default)]
+    pub mul: Option<f64>,
+    #[serde(default)]
+    pub add: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct UpgradeDef {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub desc: String,
+    #[serde(default)]
+    pub requires: Option<String>,
+    #[serde(default)]
+    pub max: f64,
+    #[serde(default)]
+    pub effects: Vec<UpgradeEffect>,
+}
+
 /// Extracted live constants from `hello.config` with protocol defaults.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RuleConfig {
     pub min_pitch: f64,
     pub max_pitch: f64,
@@ -335,8 +361,12 @@ pub struct RuleConfig {
     pub mortar_speed: f64,
     pub pickup_radius: f64,
     pub cube_stat_cap: u32,
+    pub cube_damage_per_cube: f64,
+    pub cube_hp_per_cube: f64,
+    pub cube_size_per_cube: f64,
+    pub upgrade_thresholds: Vec<u32>,
     pub sound_step_speed: f64,
-    pub raw_upgrades: Value,
+    pub upgrades: Vec<UpgradeDef>,
 }
 
 impl RuleConfig {
@@ -351,8 +381,35 @@ impl RuleConfig {
             }
             cur.as_f64().unwrap_or(def)
         };
+
+        let upgrade_thresholds: Vec<u32> = cfg
+            .get("cubes")
+            .and_then(|c| c.get("upgrade_thresholds"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| {
+                        x.as_u64()
+                            .map(|n| n as u32)
+                            .or_else(|| x.as_f64().map(|f| f.round() as u32))
+                    })
+                    .collect()
+            })
+            .filter(|v: &Vec<u32>| !v.is_empty())
+            .unwrap_or_else(|| vec![1, 3, 6, 10, 15, 21, 28, 36, 45]);
+
+        let upgrades: Vec<UpgradeDef> = cfg
+            .get("upgrades")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value::<UpgradeDef>(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
-            min_pitch: get(&["mech", "min_pitch"], -1.3),
+            min_pitch: get(&["mech", "min_pitch"], -0.7),
             max_pitch: get(&["mech", "max_pitch"], 1.3),
             step_up: get(&["mech", "step_up"], 1.2),
             max_slope_deg: get(&["mech", "max_slope_deg"], 50.0),
@@ -360,9 +417,13 @@ impl RuleConfig {
             mortar_gravity: get(&["weapons", "mortar", "gravity"], 22.0),
             mortar_speed: get(&["weapons", "mortar", "speed"], 72.0),
             pickup_radius: get(&["loot", "pickup_radius"], 4.0),
-            cube_stat_cap: get(&["cubes", "stat_cap"], 10.0) as u32,
+            cube_stat_cap: get(&["cubes", "stat_cap"], 10.0).round() as u32,
+            cube_damage_per_cube: get(&["cubes", "damage_per_cube"], 0.04),
+            cube_hp_per_cube: get(&["cubes", "hp_per_cube"], 0.04),
+            cube_size_per_cube: get(&["cubes", "size_per_cube"], 0.05),
+            upgrade_thresholds,
             sound_step_speed: get(&["sound", "step_speed"], 5.0),
-            raw_upgrades: cfg.get("upgrades").cloned().unwrap_or(Value::Null),
+            upgrades,
         }
     }
 }

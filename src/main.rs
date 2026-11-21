@@ -8,12 +8,9 @@ use belief::{BeliefMap, MatchMode};
 use combat::*;
 use nav::NavEngine;
 use protocol::*;
-use serde_json::Value;
 use std::f64::consts::PI;
 use std::io::{self, BufWriter, Write};
 use world::World;
-
-const UPGRADE_THRESHOLDS: [u32; 6] = [1, 3, 6, 10, 15, 21];
 
 struct BotBrain {
     cfg: RuleConfig,
@@ -22,6 +19,7 @@ struct BotBrain {
     belief: BeliefMap,
     last_aim: [f64; 2],
     last_target_id: Option<u64>,
+    laser_last_los_t: f64,
     strafe_sign: f64,
     last_strafe_flip: u64,
     climb_stuck_ticks: u32,
@@ -40,6 +38,7 @@ impl BotBrain {
             belief: BeliefMap::new(),
             last_aim: [0.0, 0.0],
             last_target_id: None,
+            laser_last_los_t: -10.0,
             strafe_sign: 1.0,
             last_strafe_flip: 0,
             climb_stuck_ticks: 0,
@@ -68,10 +67,11 @@ impl BotBrain {
         if let Some(offer) = &obs.offer {
             act.pick = Some(self.pick_upgrade(offer, obs));
         }
-        self.handle_weapon_pickup(obs, &mut act);
 
         let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
-        let los_enemies = count_los_enemy_mechs(obs, &self.world);
+        let los_enemies = count_los_enemy_mechs(obs, &self.cfg, &self.world);
+        self.handle_weapon_pickup(obs, los_enemies, &mut act);
+
         let target = select_target(
             obs,
             &self.cfg,
@@ -100,6 +100,7 @@ impl BotBrain {
             target.as_ref(),
             fallback_bearing,
             self.last_aim,
+            &mut self.laser_last_los_t,
             &mut act,
         );
 
@@ -119,57 +120,247 @@ impl BotBrain {
     }
 
     fn pick_upgrade(&self, offer: &Offer, obs: &ObsMsg) -> usize {
-        let held_laser = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
-        let held_lightning = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
-        let held_mortar = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "mortar"));
+        let held_slot = |k: &str| -> Option<&WeaponSlot> {
+            obs.me.weapons.iter().flatten().find(|w| w.kind == k)
+        };
+        let held_laser = held_slot("laser").is_some();
+        let held_lightning = held_slot("lightning").is_some();
+        let held_mortar = held_slot("mortar").is_some();
+        let is_ffa = self.belief.mode == MatchMode::FfaSurvival;
+
+        let apply_effect = |mut val: f64, eff: &UpgradeEffect| -> f64 {
+            if let Some(m) = eff.mul {
+                val *= m;
+            }
+            if let Some(a) = eff.add {
+                val += a;
+            }
+            val
+        };
 
         let score_choice = |c: &OfferChoice| -> f64 {
-            let id = c.id.to_lowercase();
-            let desc = c.desc.to_lowercase();
-            let mut s = 30.0;
-
-            if let Some(arr) = self.cfg.raw_upgrades.as_array() {
-                if let Some(meta) = arr
-                    .iter()
-                    .find(|u| u.get("id").and_then(Value::as_str) == Some(c.id.as_str()))
+            let Some(def) = self.cfg.upgrades.iter().find(|u| u.id == c.id) else {
+                let id = c.id.to_lowercase();
+                let desc = c.desc.to_lowercase();
+                let mut s = 30.0;
+                if id.contains("armor") || desc.contains("damage taken") {
+                    s += 120.0;
+                }
+                if id.contains("hp")
+                    || id.contains("plating")
+                    || desc.contains("max hp")
+                    || desc.contains("regen")
                 {
-                    let m = meta.to_string().to_lowercase();
-                    if m.contains("armor") || m.contains("damage_mult") {
-                        s += 110.0;
-                    }
-                    if m.contains("max_hp") || m.contains("regen") {
-                        s += 102.0;
-                    }
-                    if m.contains("walk_speed") || m.contains("energy") || m.contains("boost") {
-                        s += 88.0;
-                    }
+                    s += 115.0;
+                }
+                if id.contains("lightning") && held_lightning {
+                    s += 110.0;
+                }
+                if id.contains("laser") && held_laser {
+                    s += 105.0;
+                }
+                if id.contains("mortar") && held_mortar {
+                    s += 85.0;
+                }
+                return s;
+            };
+
+            let base_hp = obs.me.stat_f64("hp", obs.me.max_hp.max(1400.0));
+            let base_armor = obs.me.stat_f64("armor", 0.0).clamp(0.0, 0.85);
+            let base_regen = obs.me.stat_f64("regen_per_s", 45.0).max(1.0);
+            let base_delay = obs.me.stat_f64("regen_delay", self.cfg.regen_delay).max(0.5);
+            let base_walk = obs.me.stat_f64("walk_speed", 11.7).max(1.0);
+            let base_boost = obs.me.stat_f64("boost_speed", 19.5).max(1.0);
+            let base_energy = obs.me.stat_f64("energy", obs.me.max_energy.max(100.0)).max(1.0);
+            let base_eregen = obs.me.stat_f64("energy_regen", 18.0).max(1.0);
+            let base_bdrain = obs.me.stat_f64("boost_drain", 17.0).max(1.0);
+            let base_jdrain = obs.me.stat_f64("jet_drain", 15.0).max(1.0);
+            let base_turn = obs.me.stat_f64("turn_rate", 4.0).max(0.1);
+            let base_pitch = obs.me.stat_f64("pitch_rate", 3.0).max(0.1);
+            let base_near = obs.me.stat_f64("near_range_bonus", 0.0);
+            let base_vis = obs.me.stat_f64("vision_bonus", 0.0);
+            let base_hear = obs.me.stat_f64("hearing", 1.0).max(0.05);
+
+            let mut new_hp = base_hp;
+            let mut new_armor = base_armor;
+            let mut new_regen = base_regen;
+            let mut new_delay = base_delay;
+            let mut new_walk = base_walk;
+            let mut new_boost = base_boost;
+            let mut new_energy = base_energy;
+            let mut new_eregen = base_eregen;
+            let mut new_bdrain = base_bdrain;
+            let mut new_jdrain = base_jdrain;
+            let mut new_turn = base_turn;
+            let mut new_pitch = base_pitch;
+            let mut new_near = base_near;
+            let mut new_vis = base_vis;
+            let mut new_hear = base_hear;
+
+            let mut s = 0.0;
+
+            for eff in &def.effects {
+                match eff.path.as_str() {
+                    "mech.hp" => new_hp = apply_effect(new_hp, eff),
+                    "mech.armor" => new_armor = apply_effect(new_armor, eff).clamp(0.0, 0.85),
+                    "mech.regen_per_s" => new_regen = apply_effect(new_regen, eff),
+                    "mech.regen_delay" => new_delay = apply_effect(new_delay, eff).max(0.5),
+                    "mech.walk_speed" => new_walk = apply_effect(new_walk, eff),
+                    "mech.boost_speed" => new_boost = apply_effect(new_boost, eff),
+                    "mech.energy" => new_energy = apply_effect(new_energy, eff),
+                    "mech.energy_regen" => new_eregen = apply_effect(new_eregen, eff),
+                    "mech.boost_drain" => new_bdrain = apply_effect(new_bdrain, eff).max(0.5),
+                    "mech.jet_drain" => new_jdrain = apply_effect(new_jdrain, eff).max(0.5),
+                    "mech.turn_rate" => new_turn = apply_effect(new_turn, eff),
+                    "mech.pitch_rate" => new_pitch = apply_effect(new_pitch, eff),
+                    "mech.near_range_bonus" => new_near = apply_effect(new_near, eff),
+                    "mech.vision_bonus" => new_vis = apply_effect(new_vis, eff),
+                    "mech.hearing" => new_hear = apply_effect(new_hear, eff).max(0.05),
+                    _ => {}
                 }
             }
 
-            if id.contains("armor") || desc.contains("damage taken") {
-                s += 120.0;
+            // 1. EHP & armor regen-amplification delta
+            let cur_ehp = base_hp / (1.0 - base_armor).max(0.15);
+            let new_ehp = new_hp / (1.0 - new_armor).max(0.15);
+            let ehp_rel = (new_ehp - cur_ehp) / cur_ehp;
+            let armor_rel = (1.0 - base_armor) / (1.0 - new_armor).max(0.15) - 1.0;
+            s += ehp_rel * 860.0 + armor_rel * 550.0;
+
+            // 2. Out-of-combat regen delta
+            let regen_rel = (new_regen - base_regen) / base_regen;
+            let delay_red = (base_delay - new_delay).max(0.0) / base_delay;
+            s += regen_rel * 130.0 + delay_red * 145.0;
+
+            // 3. Mobility, energy & torso slew
+            s += ((new_walk - base_walk) / base_walk) * 620.0;
+            s += ((new_boost - base_boost) / base_boost) * 480.0;
+            s += ((new_energy - base_energy) / base_energy)
+                * if held_lightning { 270.0 } else { 210.0 };
+            s += ((new_eregen - base_eregen) / base_eregen)
+                * if held_lightning { 310.0 } else { 240.0 };
+            s += ((base_bdrain - new_bdrain) / base_bdrain) * 190.0;
+            s += ((base_jdrain - new_jdrain) / base_jdrain) * 120.0;
+            s += ((new_turn - base_turn) / base_turn) * 150.0;
+            s += ((new_pitch - base_pitch) / base_pitch) * 80.0;
+
+            // 4. Perception / sensors
+            let sensor_mult = if is_ffa { 1.45 } else { 0.85 };
+            s += ((new_near - base_near) * 2.8
+                + (new_vis - base_vis) * 1.1
+                + ((base_hear - new_hear) / base_hear) * 35.0)
+                * sensor_mult;
+
+            // 5. Weapon DPS & utility deltas against live weapon slot stats
+            if let Some(w) = held_slot("lightning") {
+                let b_dmg = w.stat_f64("damage", 60.0);
+                let b_cd = w.stat_f64("cooldown", 0.25).max(0.05);
+                let b_rng = w.stat_f64("range", 45.0).max(1.0);
+                let b_cone = w.stat_f64("cone_deg", 30.0).max(1.0);
+                let b_eng = w.stat_f64("energy", 3.0).max(0.1);
+                let b_chain = w.stat_f64("chain", 2.0);
+                let (mut a_dmg, mut a_cd, mut a_rng, mut a_cone, mut a_eng, mut a_chain) =
+                    (b_dmg, b_cd, b_rng, b_cone, b_eng, b_chain);
+                for eff in &def.effects {
+                    match eff.path.as_str() {
+                        "weapons.lightning.damage" => a_dmg = apply_effect(a_dmg, eff),
+                        "weapons.lightning.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
+                        "weapons.lightning.range" => a_rng = apply_effect(a_rng, eff),
+                        "weapons.lightning.cone_deg" => a_cone = apply_effect(a_cone, eff),
+                        "weapons.lightning.energy" => a_eng = apply_effect(a_eng, eff).max(0.1),
+                        "weapons.lightning.chain" => a_chain = apply_effect(a_chain, eff),
+                        _ => {}
+                    }
+                }
+                let dps_rel = ((a_dmg / a_cd) - (b_dmg / b_cd)) / (b_dmg / b_cd);
+                s += dps_rel * 480.0
+                    + ((a_rng - b_rng) / b_rng) * 520.0
+                    + ((a_cone - b_cone) / b_cone) * 130.0
+                    + ((b_eng - a_eng) / b_eng) * 210.0
+                    + (a_chain - b_chain) * if is_ffa { 42.0 } else { 92.0 };
             }
-            if id.contains("hp") || desc.contains("max hp") || desc.contains("regen") {
-                s += 105.0;
+
+            if let Some(w) = held_slot("laser") {
+                let b_dmg = w.stat_f64("damage", 315.0);
+                let b_chg = w.stat_f64("charge", 0.75).max(0.05);
+                let b_cd = w.stat_f64("cooldown", 1.65).max(0.05);
+                let b_pierce = w.stat_f64("pierce", 0.0);
+                let (mut a_dmg, mut a_chg, mut a_cd, mut a_pierce) =
+                    (b_dmg, b_chg, b_cd, b_pierce);
+                for eff in &def.effects {
+                    match eff.path.as_str() {
+                        "weapons.laser.damage" => a_dmg = apply_effect(a_dmg, eff),
+                        "weapons.laser.charge" => a_chg = apply_effect(a_chg, eff).max(0.05),
+                        "weapons.laser.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
+                        "weapons.laser.pierce" => a_pierce = apply_effect(a_pierce, eff),
+                        _ => {}
+                    }
+                }
+                let dps_b = b_dmg / (b_chg + b_cd);
+                let dps_a = a_dmg / (a_chg + a_cd);
+                s += ((dps_a - dps_b) / dps_b) * 640.0
+                    + ((b_chg - a_chg) / b_chg) * 260.0
+                    + (a_pierce - b_pierce) * if is_ffa { 55.0 } else { 85.0 };
             }
-            if id.contains("lightning") {
-                s += if held_lightning { 114.0 } else { 40.0 };
+
+            if let Some(w) = held_slot("mortar") {
+                let b_dmg = w.stat_f64("damage", 200.0);
+                let b_spl = w.stat_f64("splash", 160.0);
+                let b_cd = w.stat_f64("cooldown", 2.6).max(0.1);
+                let b_rad = w.stat_f64("splash_radius", 7.0).max(1.0);
+                let b_spd = w.stat_f64("speed", self.cfg.mortar_speed).max(1.0);
+                let (mut a_dmg, mut a_spl, mut a_cd, mut a_rad, mut a_spd) =
+                    (b_dmg, b_spl, b_cd, b_rad, b_spd);
+                for eff in &def.effects {
+                    match eff.path.as_str() {
+                        "weapons.mortar.damage" => a_dmg = apply_effect(a_dmg, eff),
+                        "weapons.mortar.splash" => a_spl = apply_effect(a_spl, eff),
+                        "weapons.mortar.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.1),
+                        "weapons.mortar.splash_radius" => a_rad = apply_effect(a_rad, eff),
+                        "weapons.mortar.speed" => a_spd = apply_effect(a_spd, eff),
+                        _ => {}
+                    }
+                }
+                let dps_b = (b_dmg + 0.5 * b_spl) / b_cd;
+                let dps_a = (a_dmg + 0.5 * a_spl) / a_cd;
+                s += ((dps_a - dps_b) / dps_b) * 460.0
+                    + ((a_rad - b_rad) / b_rad) * 300.0
+                    + ((a_spd - b_spd) / b_spd) * 380.0;
             }
-            if id.contains("laser") {
-                s += if held_laser { 104.0 } else { 40.0 };
+
+            if let Some(w) = held_slot("gun") {
+                let b_dmg = w.stat_f64("damage", 45.0);
+                let b_cd = w.stat_f64("cooldown", 0.24).max(0.05);
+                let b_mag = w.stat_f64("mag", 12.0).max(1.0);
+                let b_rel = w.stat_f64("reload", 2.4).max(0.1);
+                let b_spd = w.stat_f64("speed", 252.0).max(1.0);
+                let b_rng = w.stat_f64("range", 230.0).max(1.0);
+                let (mut a_dmg, mut a_cd, mut a_mag, mut a_rel, mut a_spd, mut a_rng) =
+                    (b_dmg, b_cd, b_mag, b_rel, b_spd, b_rng);
+                for eff in &def.effects {
+                    match eff.path.as_str() {
+                        "weapons.gun.damage" => a_dmg = apply_effect(a_dmg, eff),
+                        "weapons.gun.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
+                        "weapons.gun.mag" => a_mag = apply_effect(a_mag, eff).max(1.0),
+                        "weapons.gun.reload" => a_rel = apply_effect(a_rel, eff).max(0.1),
+                        "weapons.gun.speed" => a_spd = apply_effect(a_spd, eff),
+                        "weapons.gun.range" => a_rng = apply_effect(a_rng, eff),
+                        _ => {}
+                    }
+                }
+                let burst_b = b_dmg / b_cd;
+                let burst_a = a_dmg / a_cd;
+                let sust_b = (b_mag * b_dmg) / (b_mag * b_cd + b_rel);
+                let sust_a = (a_mag * a_dmg) / (a_mag * a_cd + a_rel);
+                let dps_rel =
+                    0.55 * ((burst_a - burst_b) / burst_b) + 0.45 * ((sust_a - sust_b) / sust_b);
+                let gun_mult = if held_lightning || held_laser { 0.42 } else { 0.72 };
+                s += (dps_rel * 580.0
+                    + ((a_spd - b_spd) / b_spd) * 240.0
+                    + ((a_rng - b_rng) / b_rng) * 100.0)
+                    * gun_mult;
             }
-            if id.contains("speed") || id.contains("energy") || id.contains("boost") {
-                s += 90.0;
-            }
-            if id.contains("sensor") || desc.contains("vision") || desc.contains("proximity") {
-                s += if self.belief.mode == MatchMode::FfaSurvival { 95.0 } else { 64.0 };
-            }
-            if id.contains("mortar") {
-                s += if held_mortar { 86.0 } else { 30.0 };
-            }
-            if id.contains("gun") {
-                s += if !held_laser && !held_lightning { 88.0 } else { 32.0 };
-            }
+
             s
         };
 
@@ -205,7 +396,7 @@ impl BotBrain {
         a == "lightning" || b == "lightning" || a == "gun" || b == "gun"
     }
 
-    fn handle_weapon_pickup(&self, obs: &ObsMsg, act: &mut Action) {
+    fn handle_weapon_pickup(&self, obs: &ObsMsg, los_enemies: usize, act: &mut Action) {
         let held: Vec<Option<&str>> = obs
             .me
             .weapons
@@ -227,7 +418,8 @@ impl BotBrain {
                 if new_prio > 0 && best.map_or(true, |b| new_prio > b.0) {
                     best = Some((new_prio, p.id, None));
                 }
-            } else {
+            } else if los_enemies == 0 {
+                // Never trigger a 1.0–1.65 s equip lockout swap while under LOS fire
                 for (slot_idx, slot) in obs.me.weapons.iter().enumerate().take(2) {
                     let Some(w) = slot else { continue };
                     if w.kind == "laser" && w.charge > 0.0 {
@@ -316,12 +508,15 @@ impl BotBrain {
         }
 
         // 3. Ground-level high-value weapon pickups (lightning / laser)
-        let next_hits_upgrade = UPGRADE_THRESHOLDS.contains(&(obs.me.cubes + 1));
+        let next_hits_upgrade = self.cfg.upgrade_thresholds.contains(&(obs.me.cubes + 1));
         let empty_slot = obs.me.weapons.iter().any(|w| w.is_none());
         let best_pickup = obs
             .pickups
             .iter()
             .filter(|p| {
+                if !empty_slot && los_enemies > 0 {
+                    return false;
+                }
                 let already_have = obs
                     .me
                     .weapons
@@ -377,7 +572,14 @@ impl BotBrain {
         }
 
         // 5. Fast 10-cube snowball: loose cubes > NPCs (2 cubes) > ground crates
-        let want_cubes = obs.me.cubes < self.cfg.cube_stat_cap || obs.me.cubes == 14;
+        let next_threshold_close = self
+            .cfg
+            .upgrade_thresholds
+            .iter()
+            .copied()
+            .find(|&th| th > obs.me.cubes)
+            .map_or(false, |th| th - obs.me.cubes <= 2 && th <= 21);
+        let want_cubes = obs.me.cubes < self.cfg.cube_stat_cap || next_threshold_close;
         if want_cubes {
             if let Some(c) = obs
                 .cubes
@@ -460,8 +662,16 @@ impl BotBrain {
         let height = obs.me.height();
         let my_eye_off = obs.me.eye_height();
 
-        let has_lightning = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
-        let has_laser = obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
+        let has_lightning = obs
+            .me
+            .weapons
+            .iter()
+            .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
+        let has_laser = obs
+            .me
+            .weapons
+            .iter()
+            .any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
 
         if obs.tick.saturating_sub(self.last_strafe_flip) >= 18 {
             self.strafe_sign = -self.strafe_sign;
@@ -475,7 +685,7 @@ impl BotBrain {
             .filter(|m| m.kind == "mech")
             .map(|m| {
                 let d2 = (m.pos[0] - pos[0]).powi(2) + (m.pos[1] - pos[1]).powi(2);
-                let h = 9.0 * (1.0 + 0.05 * m.cubes as f64);
+                let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * m.cubes as f64);
                 (d2, [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h])
             })
             .filter(|(d2, _)| *d2 <= 155.0 * 155.0)
@@ -571,6 +781,7 @@ impl BotBrain {
                 radius + 0.2,
                 height,
                 self.cfg.step_up,
+                self.cfg.max_slope_deg,
             );
             let ok_far = ok_near
                 && self.world.is_walkable_step(
@@ -580,6 +791,7 @@ impl BotBrain {
                     radius + 0.2,
                     height,
                     self.cfg.step_up,
+                    self.cfg.max_slope_deg,
                 );
 
             let mut score = if ok_far {
@@ -596,12 +808,15 @@ impl BotBrain {
             if d_cur_z > obs.zone.radius - 4.0 {
                 score -= 220.0;
             } else if !obs.me.in_zone {
-                let d_next_z = ((lx - obs.zone.next_center[0]).powi(2) + (ly - obs.zone.next_center[1]).powi(2)).sqrt();
+                let d_next_z = ((lx - obs.zone.next_center[0]).powi(2)
+                    + (ly - obs.zone.next_center[1]).powi(2))
+                .sqrt();
                 score -= d_next_z * 2.5;
             }
 
             if dodge_len > 0.05 {
-                score += (ux * dodge_u[0] + uy * dodge_u[1]) * if urgent_dodge { 155.0 } else { 78.0 };
+                score += (ux * dodge_u[0] + uy * dodge_u[1])
+                    * if urgent_dodge { 155.0 } else { 78.0 };
             }
 
             let nav_dot = ux * nav_u[0] + uy * nav_u[1];
@@ -673,6 +888,7 @@ impl BotBrain {
             radius + 0.2,
             height,
             self.cfg.step_up,
+            self.cfg.max_slope_deg,
         ) {
             self.strafe_sign = -self.strafe_sign;
             self.last_strafe_flip = obs.tick;
@@ -691,7 +907,8 @@ impl BotBrain {
         act.move_dir = [best_yaw.cos() * mag, best_yaw.sin() * mag];
 
         let min_boost_energy = if has_lightning { 38.0 } else { 20.0 };
-        let early_loot_sprint = !in_combat && obs.me.cubes < self.cfg.cube_stat_cap && obs.me.energy > 72.0;
+        let early_loot_sprint =
+            !in_combat && obs.me.cubes < self.cfg.cube_stat_cap && obs.me.energy > 72.0;
         let need_sprint = urgent_dodge
             || !obs.me.in_zone
             || (seek_heal && los_enemies > 0)

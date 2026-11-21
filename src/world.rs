@@ -219,6 +219,7 @@ impl World {
         radius: f64,
         height: f64,
         step_up: f64,
+        max_slope_deg: f64,
     ) -> bool {
         if nx < self.min_x + radius
             || nx > self.max_x - radius
@@ -229,6 +230,7 @@ impl World {
         }
         let gz = self.terrain_height(nx, ny);
         let mut support_z = gz;
+        let mut on_prism = false;
 
         let gx0 = (((nx - radius - self.min_x) / CELL_SIZE).floor() as isize)
             .clamp(0, self.grid_nx as isize - 1) as usize;
@@ -260,6 +262,7 @@ impl World {
                     }
                     if p.top <= pos[2] + step_up && p.top > support_z {
                         support_z = p.top;
+                        on_prism = true;
                         continue;
                     }
                     if p.base >= pos[2] + height {
@@ -269,7 +272,55 @@ impl World {
                 }
             }
         }
-        (support_z - pos[2]) <= step_up
+
+        if on_prism {
+            return (support_z - pos[2]) <= step_up;
+        }
+
+        let dx = nx - pos[0];
+        let dy = ny - pos[1];
+        let horiz = (dx * dx + dy * dy).sqrt();
+        if horiz < 1e-4 {
+            return (support_z - pos[2]) <= step_up;
+        }
+
+        let max_tan = max_slope_deg.to_radians().tan();
+        if (gz - pos[2]) > (horiz * max_tan).max(step_up) {
+            return false;
+        }
+
+        let ux = dx / horiz;
+        let uy = dy / horiz;
+        let steps = (horiz / 1.0).ceil().clamp(1.0, 8.0) as usize;
+        let ds = horiz / steps as f64;
+        let eps = 0.5 * self.step.max(0.5);
+        let mut prev_z = pos[2].max(self.terrain_height(pos[0], pos[1]));
+
+        for s in 1..=steps {
+            let f = s as f64 / steps as f64;
+            let px = pos[0] + dx * f;
+            let py = pos[1] + dy * f;
+            let cur_z = self.terrain_height(px, py);
+            let dz = cur_z - prev_z;
+
+            if dz > 0.0 && (dz / ds) > max_tan {
+                return false;
+            }
+
+            let dhdx = (self.terrain_height(px + eps, py) - self.terrain_height(px - eps, py))
+                / (2.0 * eps);
+            let dhdy = (self.terrain_height(px, py + eps) - self.terrain_height(px, py - eps))
+                / (2.0 * eps);
+            let grad = (dhdx * dhdx + dhdy * dhdy).sqrt();
+            let dir_grad = dhdx * ux + dhdy * uy;
+            if dir_grad > max_tan || (grad > max_tan && cur_z > prev_z - 0.05) {
+                return false;
+            }
+
+            prev_z = cur_z;
+        }
+
+        true
     }
 
     /// Fast 3D raycast using 2D Amanatides–Woo DDA grid traversal + prism deduplication.

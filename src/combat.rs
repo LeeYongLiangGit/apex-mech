@@ -203,7 +203,7 @@ pub fn solve_mortar(
     None
 }
 
-pub fn count_los_enemy_mechs(obs: &ObsMsg, world: &World) -> usize {
+pub fn count_los_enemy_mechs(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> usize {
     let my_eye = [
         obs.me.pos[0],
         obs.me.pos[1],
@@ -215,7 +215,7 @@ pub fn count_los_enemy_mechs(obs: &ObsMsg, world: &World) -> usize {
             if m.kind != "mech" {
                 return false;
             }
-            let h = 9.0 * (1.0 + 0.05 * m.cubes as f64);
+            let h = 9.0 * (1.0 + cfg.cube_size_per_cube * m.cubes as f64);
             let e_mid = [m.pos[0], m.pos[1], m.pos[2] + 0.55 * h];
             world.raycast_solid(my_eye, e_mid).is_none()
         })
@@ -255,7 +255,7 @@ pub fn select_target(
     for m in &obs.mechs {
         let is_mech = m.kind == "mech";
         let h = if is_mech {
-            9.0 * (1.0 + 0.05 * m.cubes as f64)
+            9.0 * (1.0 + cfg.cube_size_per_cube * m.cubes as f64)
         } else {
             3.5
         };
@@ -367,6 +367,51 @@ pub fn select_target(
     best
 }
 
+fn maybe_cover_reload(
+    obs: &ObsMsg,
+    los_enemies: usize,
+    target: Option<&TargetInfo>,
+    ceasefire_for_regen: bool,
+    ffa_hold: bool,
+    act: &mut Action,
+) {
+    let Some((slot_idx, w)) = obs
+        .me
+        .weapons
+        .iter()
+        .enumerate()
+        .take(2)
+        .find_map(|(i, s)| s.as_ref().filter(|w| w.kind == "gun").map(|w| (i, w)))
+    else {
+        return;
+    };
+    if act.fire[slot_idx] || w.reload > 0.0 {
+        return;
+    }
+    let mag = w.stat_f64("mag", 12.0).round().max(1.0) as u32;
+    let ammo = w.ammo.unwrap_or(mag);
+    if ammo >= mag {
+        return;
+    }
+    let gun_range = w.stat_f64("range", 230.0);
+    let holding_fire = target.is_none() || ceasefire_for_regen || ffa_hold;
+    let target_behind_cover = target.map_or(true, |t| !t.los || t.dist > gun_range);
+
+    if holding_fire {
+        if los_enemies == 0 || ammo <= (mag * 2) / 3 {
+            act.reload = true;
+        }
+    } else if target_behind_cover {
+        if los_enemies == 0 {
+            if ammo <= (mag * 3) / 4 {
+                act.reload = true;
+            }
+        } else if ammo <= (mag / 3).max(1) {
+            act.reload = true;
+        }
+    }
+}
+
 pub fn decide_combat(
     obs: &ObsMsg,
     cfg: &RuleConfig,
@@ -378,6 +423,7 @@ pub fn decide_combat(
     target: Option<&TargetInfo>,
     fallback_bearing: Option<f64>,
     last_aim: [f64; 2],
+    laser_last_los_t: &mut f64,
     act: &mut Action,
 ) {
     let muzzle = [
@@ -386,7 +432,8 @@ pub fn decide_combat(
         obs.me.pos[2] + obs.me.muzzle_height(),
     ];
     let turn_rate = obs.me.turn_rate();
-    let cube_mult = 1.0 + 0.04 * (obs.me.cubes.min(cfg.cube_stat_cap) as f64);
+    let cube_mult =
+        1.0 + cfg.cube_damage_per_cube * (obs.me.cubes.min(cfg.cube_stat_cap) as f64);
 
     let Some(t) = target else {
         if let Some(yaw) = fallback_bearing {
@@ -394,16 +441,7 @@ pub fn decide_combat(
         } else {
             act.aim = [last_aim[0] + 0.16, -0.02];
         }
-        if let Some(Some(w)) = obs
-            .me
-            .weapons
-            .iter()
-            .find(|s| s.as_ref().map_or(false, |w| w.kind == "gun"))
-        {
-            if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 6 {
-                act.reload = true;
-            }
-        }
+        maybe_cover_reload(obs, los_enemies, None, ceasefire_for_regen, false, act);
         return;
     };
 
@@ -414,19 +452,6 @@ pub fn decide_combat(
     ];
     let direct_aim = aim_to(muzzle, short_lead_pt);
     act.aim = direct_aim;
-
-    if ceasefire_for_regen && (!t.los || !t.is_mech) {
-        return;
-    }
-
-    let ffa_hold = mode == MatchMode::FfaSurvival
-        && t.is_mech
-        && t.dist > 95.0
-        && t.hp > 1000.0
-        && obs.alive > 5;
-    if ffa_hold {
-        return;
-    }
 
     let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
         obs.me
@@ -441,6 +466,27 @@ pub fn decide_combat(
     let mortar_slot = find_slot("mortar");
     let gun_slot = find_slot("gun");
     let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
+
+    let laser_charging = laser_slot.map_or(false, |(_, w)| w.charge > 0.0);
+    if laser_charging && t.los {
+        *laser_last_los_t = obs.t;
+    }
+    let laser_in_grace = laser_charging && t.is_mech && (obs.t - *laser_last_los_t) <= 0.35;
+
+    if ceasefire_for_regen && (!t.los || !t.is_mech) && !laser_in_grace {
+        maybe_cover_reload(obs, los_enemies, Some(t), true, false, act);
+        return;
+    }
+
+    let ffa_hold = mode == MatchMode::FfaSurvival
+        && t.is_mech
+        && t.dist > 95.0
+        && t.hp > 1000.0
+        && obs.alive > 5;
+    if ffa_hold && !laser_charging {
+        maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, true, act);
+        return;
+    }
 
     // 1. Lightning inside range (240 guaranteed DPS + chain + laser short)
     if let Some((i, w)) = lightning_slot {
@@ -457,7 +503,7 @@ pub fn decide_combat(
         }
     }
 
-    // 2. Laser: never pre-charge out of LOS, avoid 50% speed penalty under multi-bot fire
+    // 2. Laser: 0.35 s LOS-blink grace window + allow multi-enemy charge outside close/dodge
     if let Some((i, w)) = laser_slot {
         let range = w.stat_f64("range", 280.0);
         let full_charge = w.stat_f64("charge", 0.75);
@@ -466,11 +512,12 @@ pub fn decide_combat(
         let base_dmg = w.stat_f64("damage", 315.0);
         let hold_s = w.stat_f64("hold_s", 2.0);
 
+        let multi_enemy_ok = los_enemies <= 1 || t.has_mortar || t.dist > 50.0;
         let safe_to_charge = !t.is_crate
             && t.los
             && t.dist <= range
             && (t.dist > 45.0 || !has_close_weapon)
-            && (los_enemies <= 1 || t.has_mortar)
+            && multi_enemy_ok
             && !urgent_dodge;
 
         if w.charge > 0.0 {
@@ -497,17 +544,26 @@ pub fn decide_combat(
                 || (w.charge >= min_charge && expected_dmg >= t.hp * 1.02)
                 || (w.charge >= full_charge + hold_s - 0.25);
 
+            let los_lost_s = (obs.t - *laser_last_los_t).max(0.0);
+            let los_grace_expired = !t.los && los_lost_s > 0.35;
+
             if ready && t.los && aligned && barrel_clear {
                 act.fire[i] = false;
                 return;
-            } else if w.charge >= full_charge + hold_s - 0.20 || (urgent_dodge && t.dist < 32.0) || !t.los {
+            } else if w.charge >= full_charge + hold_s - 0.20
+                || (urgent_dodge && t.dist < 32.0)
+                || los_grace_expired
+            {
                 act.fire[i] = false; // Drop charge to regain full speed
+                maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
                 return;
             } else {
                 act.fire[i] = true;
+                maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
                 return;
             }
         } else if w.cooldown <= 0.0 && safe_to_charge {
+            *laser_last_los_t = obs.t;
             act.aim = direct_aim;
             act.fire[i] = true;
             return;
@@ -517,9 +573,8 @@ pub fn decide_combat(
     // 3. Dual-arc Mortar
     if let Some((i, w)) = mortar_slot {
         let gun_ready = gun_slot.map_or(false, |(_, g)| g.reload <= 0.0 && t.los && t.dist < 140.0);
-        let want_mortar = !t.is_crate
-            && w.cooldown <= 0.08
-            && (!t.los || t.has_lightning || !gun_ready);
+        let want_mortar =
+            !t.is_crate && w.cooldown <= 0.08 && (!t.los || t.has_lightning || !gun_ready);
         if want_mortar {
             let speed = w.stat_f64("speed", cfg.mortar_speed);
             if let Some(sol) = solve_mortar(obs, cfg, world, t.pos, t.vel, speed) {
@@ -529,6 +584,7 @@ pub fn decide_combat(
                 if yaw_err < 0.06 && pitch_err < 0.06 {
                     act.fire[i] = true;
                 }
+                maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
                 return;
             }
         }
@@ -559,8 +615,8 @@ pub fn decide_combat(
             {
                 act.fire[i] = true;
             }
-        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 5 {
-            act.reload = true;
+        } else {
+            maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
         }
     }
 }
@@ -642,7 +698,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
         if m.kind != "mech" || !m.charging {
             continue;
         }
-        let h = 9.0 * (1.0 + 0.05 * m.cubes as f64);
+        let h = 9.0 * (1.0 + cfg.cube_size_per_cube * m.cubes as f64);
         let muzzle = [m.pos[0], m.pos[1], m.pos[2] + h * 0.78];
         let d_to_me = dist_3d(muzzle, my_center);
         if d_to_me > 280.0 || world.raycast_solid(muzzle, my_center).is_some() {
