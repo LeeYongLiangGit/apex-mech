@@ -652,9 +652,9 @@ impl NavEngine {
                     -(los_count as f64) * 130.0
                 }
             } else if los_count == 1 {
-                210.0 // Clean 1v1 isolation
+                210.0
             } else if los_count == 0 {
-                175.0 // Full break-contact is also strong under multi-bot focus
+                175.0
             } else {
                 -(los_count as f64) * 110.0
             };
@@ -684,6 +684,54 @@ impl NavEngine {
             }
         }
 
+        best.map(|(_, p)| p)
+    }
+
+    /// Nearest walkable ground cover-edge (`near_cover`) cell inside `next_zone`,
+    /// keeping the mech anchored beside building corners instead of the open Oval center.
+    pub fn find_cover_anchor(
+        &self,
+        pos: [f64; 3],
+        next_center: [f64; 2],
+        next_radius: f64,
+        max_dist: f64,
+    ) -> Option<[f64; 3]> {
+        let (cgx, cgy) = self.world_to_grid(pos[0], pos[1]);
+        let r_cells = (max_dist / NAV_STEP).ceil() as isize;
+        let safe_r = (next_radius - 10.0).max(5.0);
+
+        let mut best: Option<(f64, [f64; 3])> = None;
+        for dy in (-r_cells..=r_cells).step_by(2) {
+            let ny = cgy as isize + dy;
+            if ny <= 1 || ny >= (self.ny as isize - 1) {
+                continue;
+            }
+            for dx in (-r_cells..=r_cells).step_by(2) {
+                let nx = cgx as isize + dx;
+                if nx <= 1 || nx >= (self.nx as isize - 1) {
+                    continue;
+                }
+                let (ux, uy) = (nx as usize, ny as usize);
+                let c = self.cells[uy * self.nx + ux];
+                if c.blocked_ground || !c.near_cover {
+                    continue;
+                }
+                let (wx, wy) = self.grid_to_world(ux, uy);
+                let d_next =
+                    ((wx - next_center[0]).powi(2) + (wy - next_center[1]).powi(2)).sqrt();
+                if d_next > safe_r {
+                    continue;
+                }
+                let d_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();
+                if d_me > max_dist {
+                    continue;
+                }
+                let score = -d_me * 1.0 - d_next * 0.25;
+                if best.map_or(true, |(bs, _)| score > bs) {
+                    best = Some((score, [wx, wy, c.ground_z as f64]));
+                }
+            }
+        }
         best.map(|(_, p)| p)
     }
 

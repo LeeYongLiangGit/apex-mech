@@ -321,7 +321,6 @@ fn compute_mortar_aim_point(
         let zy = aim_pt[1] - obs.zone.center[1];
         let dz = (zx * zx + zy * zy).sqrt();
         if dz > 5.0 && dz >= (obs.zone.radius - 22.0).max(0.0) {
-            // Land shell 2.4 m inside their position so radial knockback launches them out
             aim_pt[0] -= (zx / dz) * 2.4;
             aim_pt[1] -= (zy / dz) * 2.4;
             zone_knock = true;
@@ -412,19 +411,15 @@ pub fn select_target(
         let mut score = if is_mech {
             1060.0
         } else if obs.me.cubes < cfg.cube_stat_cap {
-            680.0
+            580.0
         } else {
             340.0
         } - d * 2.6;
 
-        // Only apply the 1400-HP execute scale to mechs; NPCs have 350 HP.
-        if is_mech {
-            score += (1400.0 - hp).max(0.0) * 0.90;
-            if hp <= 420.0 {
-                score += 310.0;
-            }
-        } else {
-            score += (350.0 - hp).max(0.0) * 0.45;
+        // Preserve Iter 8's aggressive NPC 2-cube farm priority + mech execute scaling
+        score += (1400.0 - hp).max(0.0) * 0.90;
+        if is_mech && hp <= 420.0 {
+            score += 310.0;
         }
         if prev_target_id == Some(m.id as u64) && los {
             score += 140.0;
@@ -626,16 +621,50 @@ pub fn decide_combat(
         return;
     }
 
-    // 1. Lightning inside range (240 guaranteed DPS + chain + laser short)
-    if let Some((i, w)) = lightning_slot {
-        let range = w.stat_f64("range", 45.0);
-        let cone = w.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
+    // 1. Lightning inside range (240 DPS + chain + laser short)
+    //    Twin-arm dual-fire: simultaneously fire Arm Gun when gun_lead sits inside Lightning cone!
+    if let Some((li, lw)) = lightning_slot {
+        let range = lw.stat_f64("range", 45.0);
+        let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
         let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
         if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
-            act.aim = direct_aim;
+            let mut chosen_aim = direct_aim;
+            let mut dual_gun: Option<(usize, [f64; 2])> = None;
+
+            if let Some((gi, gw)) = gun_slot {
+                let g_range = gw.stat_f64("range", 230.0);
+                let g_speed = gw.stat_f64("speed", 252.0);
+                if gw.reload <= 0.0 && t.dist <= g_range {
+                    let lead = lead_aim(muzzle, t.pos, t.vel, g_speed, world);
+                    if angle_diff(lead[0], direct_aim[0]).abs() <= cone * 0.78 {
+                        chosen_aim = lead;
+                        dual_gun = Some((gi, lead));
+                    }
+                }
+            }
+
+            act.aim = chosen_aim;
             let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate, pitch_rate);
             if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
-                act.fire[i] = true;
+                act.fire[li] = true;
+            }
+
+            if let Some((gi, lead)) = dual_gun {
+                let yaw_err = angle_diff(pred[0], lead[0]).abs();
+                let pitch_err = (pred[1] - lead[1]).abs();
+                let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
+                let dir = aim_dir(pred);
+                let barrel_tip = [
+                    muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
+                    muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
+                    muzzle[2] + dir[2] * (obs.me.radius() + 0.5),
+                ];
+                if yaw_err <= hit_tol
+                    && pitch_err <= hit_tol
+                    && world.raycast_solid(muzzle, barrel_tip).is_none()
+                {
+                    act.fire[gi] = true;
+                }
             }
             return;
         }
@@ -689,6 +718,40 @@ pub fn decide_combat(
                 *peek_point = find_laser_peek_point(obs, cfg, world, t.pos);
             }
 
+            // Twin-arm opportunistic off-hand fire while holding laser charge (zero aim disturbance)
+            let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate, pitch_rate);
+            if t.los {
+                if let Some((li, lw)) = lightning_slot {
+                    let l_range = lw.stat_f64("range", 45.0);
+                    let l_cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
+                    if t.dist <= l_range - 0.5
+                        && obs.me.energy >= 7.0
+                        && angle_diff(pred[0], direct_aim[0]).abs() <= l_cone
+                    {
+                        act.fire[li] = true;
+                    }
+                } else if let Some((gi, gw)) = gun_slot {
+                    let g_range = gw.stat_f64("range", 230.0);
+                    let g_speed = gw.stat_f64("speed", 252.0);
+                    if gw.reload <= 0.0 && t.dist <= g_range {
+                        let lead = lead_aim(muzzle, t.pos, t.vel, g_speed, world);
+                        let g_tol = (3.0 / t.dist.max(6.0)).clamp(0.030, 0.22);
+                        let g_dir = aim_dir(pred);
+                        let g_tip = [
+                            muzzle[0] + g_dir[0] * (obs.me.radius() + 0.5),
+                            muzzle[1] + g_dir[1] * (obs.me.radius() + 0.5),
+                            muzzle[2] + g_dir[2] * (obs.me.radius() + 0.5),
+                        ];
+                        if angle_diff(pred[0], lead[0]).abs() <= g_tol
+                            && (pred[1] - lead[1]).abs() <= g_tol
+                            && world.raycast_solid(muzzle, g_tip).is_none()
+                        {
+                            act.fire[gi] = true;
+                        }
+                    }
+                }
+            }
+
             if ready && t.los && aligned && barrel_clear {
                 act.fire[i] = false;
                 return;
@@ -728,7 +791,6 @@ pub fn decide_combat(
             let enemy_peeking_soon = world.raycast_solid(muzzle, pred_t).is_none();
             let corner_peek = find_laser_peek_point(obs, cfg, world, t.pos);
             if enemy_peeking_soon || corner_peek.is_some() {
-                // Allow 0.85 s (0.50 + 0.35 grace) to finish 0.75 s charge and clear corner
                 *laser_last_los_t = obs.t + 0.50;
                 *peek_point = corner_peek;
                 act.aim = if enemy_peeking_soon {

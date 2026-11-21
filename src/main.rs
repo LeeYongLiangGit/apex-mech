@@ -2,6 +2,7 @@ mod belief;
 mod combat;
 mod nav;
 mod protocol;
+mod tactics;
 mod world;
 
 use belief::{BeliefMap, MatchMode};
@@ -72,17 +73,23 @@ impl BotBrain {
         let los_enemies = count_los_enemy_mechs(obs, &self.cfg, &self.world);
         self.handle_weapon_pickup(obs, los_enemies, &mut act);
 
-        let target = select_target(
+        let visible_target = select_target(
             obs,
             &self.cfg,
             &self.world,
             self.belief.mode,
             self.last_target_id,
         );
-        self.last_target_id = target.as_ref().filter(|t| t.is_mech).map(|t| t.id);
+        self.last_target_id = visible_target.as_ref().filter(|t| t.is_mech).map(|t| t.id);
+
+        // Fall back to through-foliage / over-wall mortar suppression on recently tracked mechs
+        let combat_target = visible_target.clone().or_else(|| {
+            tactics::find_tracked_blind_target(obs, &self.cfg, &self.world, &self.belief)
+        });
 
         let hp_frac = obs.me.hp / obs.me.max_hp.max(1.0);
         let seek_heal = hp_frac < 0.48 && obs.me.in_zone;
+        let hold_regen = tactics::should_hold_regen(obs, los_enemies, self.belief.last_combat_t);
         let ceasefire_for_regen = hp_frac < 0.80
             && obs.me.in_zone
             && los_enemies == 0
@@ -98,7 +105,7 @@ impl BotBrain {
             los_enemies,
             ceasefire_for_regen,
             urgent_dodge,
-            target.as_ref(),
+            combat_target.as_ref(),
             fallback_bearing,
             self.last_aim,
             &mut self.laser_last_los_t,
@@ -108,9 +115,10 @@ impl BotBrain {
 
         self.decide_movement(
             obs,
-            target.as_ref(),
+            visible_target.as_ref(),
             los_enemies,
             seek_heal,
+            hold_regen,
             peek_point,
             dodge,
             urgent_dodge,
@@ -465,6 +473,7 @@ impl BotBrain {
         visible_threat_eyes: &[[f64; 3]],
         los_enemies: usize,
         seek_heal: bool,
+        hold_regen: bool,
     ) -> [f64; 3] {
         let pos = obs.me.pos;
         let next_z = [
@@ -574,7 +583,7 @@ impl BotBrain {
             }
         }
 
-        // 4. State-aware supply drops (check zone safety, enemy capture ETA, and active hold)
+        // 4. Supply drops (exact Iter 8 logic: skip only if contested by >=2 LOS mechs)
         let near_mechs = obs
             .mechs
             .iter()
@@ -582,30 +591,7 @@ impl BotBrain {
             .count();
         for d in &obs.drops {
             let dist = dist_2d(pos, d.pos);
-            let we_hold = d.holder == Some(obs.me.id);
-            let d_cur_z = ((d.pos[0] - obs.zone.center[0]).powi(2)
-                + (d.pos[1] - obs.zone.center[1]).powi(2))
-            .sqrt();
-            let in_next = self.is_in_safe_next_zone(d.pos[0], d.pos[1], obs, 4.0);
-            let safe_for_cap = in_next
-                || (d_cur_z <= obs.zone.radius - 8.0
-                    && time_to_shrink > d.lands_in + d.capture_s + 4.0);
-            if !safe_for_cap {
-                continue;
-            }
-            if we_hold && obs.me.hp / obs.me.max_hp.max(1.0) > 0.35 && los_enemies <= 1 {
-                return d.pos;
-            }
             if d.lands_in <= 14.0 && dist < 140.0 && los_enemies <= 1 {
-                if let Some(holder) = d.holder {
-                    if holder != obs.me.id {
-                        let rem = (d.capture_s - d.progress).max(0.0);
-                        let eta = dist / 14.5;
-                        if rem + 0.5 < eta {
-                            continue;
-                        }
-                    }
-                }
                 if self.belief.mode != MatchMode::FfaSurvival || near_mechs == 0 {
                     return d.pos;
                 } else if dist > 45.0 {
@@ -644,7 +630,6 @@ impl BotBrain {
                 .iter()
                 .filter(|m| {
                     m.kind == "npc"
-                        && (m.pos[2] - pos[2]) <= self.cfg.step_up + 1.5
                         && self.is_in_safe_next_zone(m.pos[0], m.pos[1], obs, 10.0)
                         && dist_2d(pos, m.pos) < 80.0
                 })
@@ -667,9 +652,10 @@ impl BotBrain {
             }
         }
 
-        // 6. Mode-specific mid/late objective
+        // 6. Mode-specific mid/late objective (skip blind hunting while actively finishing regen)
         if self.belief.mode == MatchMode::PracticeHivemind
             && obs.me.hp / obs.me.max_hp.max(1.0) > 0.62
+            && !hold_regen
         {
             if let Some(t) = target {
                 if t.is_mech {
@@ -690,6 +676,16 @@ impl BotBrain {
             }
         }
 
+        // 7. Anchor near a building edge inside next_zone instead of the open Oval center
+        if let Some(anchor) = self.nav.find_cover_anchor(
+            pos,
+            obs.zone.next_center,
+            obs.zone.next_radius,
+            90.0,
+        ) {
+            return anchor;
+        }
+
         next_z
     }
 
@@ -699,6 +695,7 @@ impl BotBrain {
         target: Option<&TargetInfo>,
         los_enemies: usize,
         seek_heal: bool,
+        hold_regen: bool,
         peek_point: Option<[f64; 3]>,
         dodge: [f64; 2],
         urgent_dodge: bool,
@@ -725,7 +722,7 @@ impl BotBrain {
             self.last_strafe_flip = obs.tick;
         }
 
-        // Strictly currently-visible enemy mechs (top 4 closest) for combat steering
+        // Strictly currently-visible enemy mechs within 155 m (top 4 closest) for combat steering
         let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
             .mechs
             .iter()
@@ -741,7 +738,14 @@ impl BotBrain {
         vis_enemies.truncate(4);
         let visible_threat_eyes: Vec<[f64; 3]> = vis_enemies.into_iter().map(|(_, p)| p).collect();
 
-        let goal = self.choose_macro_goal(obs, target, &visible_threat_eyes, los_enemies, seek_heal);
+        let goal = self.choose_macro_goal(
+            obs,
+            target,
+            &visible_threat_eyes,
+            los_enemies,
+            seek_heal,
+            hold_regen,
+        );
         let allow_jet = self.belief.mode == MatchMode::FfaSurvival
             && los_enemies == 0
             && obs.me.energy >= 65.0
@@ -796,12 +800,14 @@ impl BotBrain {
         let primary_mech = target.filter(|t| t.is_mech);
         let escape_dir = self.belief.escape_vector(pos, obs.t);
 
-        let active_drop = obs.drops.iter().find(|d| {
-            d.holder == Some(obs.me.id)
-                && d.lands_in <= 0.1
-                && obs.me.hp / obs.me.max_hp.max(1.0) > 0.35
-                && los_enemies <= 1
-        });
+        let laser_threats = tactics::active_laser_threats(obs, &self.cfg, &self.world);
+        let secondary_eyes = if !seek_heal && los_enemies == 1 {
+            primary_mech
+                .map(|pm| tactics::secondary_threat_eyes(obs, &self.cfg, &self.belief, pm.id))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Corner peek-out unit vector when pre-charging laser behind cover
         let peek_u = peek_point.and_then(|pk| {
@@ -811,8 +817,7 @@ impl BotBrain {
             if len > 0.5 { Some([dx / len, dy / len]) } else { None }
         });
 
-        // Duck briefly behind cover during zero-DPS burst cooldowns (e.g., lightning+laser at >45 m
-        // while laser cools down for 1.65 s, or gun reloading + burst cooling down)
+        // Duck briefly behind cover during zero-DPS burst cooldowns
         let lightning_active = lightning_w.map_or(false, |w| {
             let rng = w.stat_f64("range", 45.0);
             obs.me.energy >= 7.0 && primary_mech.map_or(false, |pm| pm.los && pm.dist <= rng + 4.0)
@@ -827,11 +832,15 @@ impl BotBrain {
             && !gun_active
             && !seek_heal;
 
-        // Stay at the edge of lightning range (37m) for max bullet-dodging space
+        // Stay at the edge of lightning range (37 m) for max bullet-dodging space;
+        // only hold laser distance against mortar bots if we actually carry a laser
         let ideal_dist = if let Some(pm) = primary_mech {
             if seek_heal || los_enemies >= 2 {
                 90.0
-            } else if has_lightning && obs.me.energy >= 20.0 && !pm.has_mortar {
+            } else if has_lightning
+                && obs.me.energy >= 20.0
+                && (!pm.has_mortar || !has_laser || pm.dist <= 48.0)
+            {
                 37.0
             } else if pm.has_lightning && !has_lightning {
                 68.0
@@ -893,22 +902,12 @@ impl BotBrain {
                 score -= d_next_z * 2.5;
             }
 
-            if let Some(d) = active_drop {
-                let sx4 = pos[0] + ux * 4.0;
-                let sy4 = pos[1] + uy * 4.0;
-                let d_ring = ((sx4 - d.pos[0]).powi(2) + (sy4 - d.pos[1]).powi(2)).sqrt();
-                if !urgent_dodge && d_ring > (d.radius - 1.0).max(2.0) {
-                    score -= 75.0;
-                }
-            }
-
             if dodge_len > 0.05 {
                 score += (ux * dodge_u[0] + uy * dodge_u[1])
                     * if urgent_dodge { 155.0 } else { 78.0 };
             }
 
             if let Some(pu) = peek_u {
-                // Step cleanly around the corner while pre-charging laser
                 score += (ux * pu[0] + uy * pu[1]) * 95.0;
             }
 
@@ -924,53 +923,80 @@ impl BotBrain {
             };
             score += nav_dot * nav_weight;
 
-            if in_combat && ok_near {
+            if (in_combat || !laser_threats.is_empty()) && ok_near {
                 let cand_z = if on_roof {
                     pos[2]
                 } else {
                     self.world.terrain_height(lx, ly)
                 };
                 let cand_eye = [lx, ly, cand_z + my_eye_off];
-                let mut future_los = 0_usize;
-                for &te in &visible_threat_eyes {
-                    if self.world.raycast_solid(te, cand_eye).is_none() {
-                        future_los += 1;
+
+                // Step behind solid geometry to blank incoming enemy laser charges
+                if !laser_threats.is_empty() {
+                    let blanked = laser_threats
+                        .iter()
+                        .filter(|&&lm| self.world.raycast_solid(lm, cand_eye).is_some())
+                        .count();
+                    if blanked > 0 {
+                        score += (blanked as f64) * 110.0;
                     }
                 }
 
-                if seek_heal || los_enemies >= 2 {
-                    score += (ux * escape_dir[0] + uy * escape_dir[1]) * 26.0;
-                    if future_los == 0 {
-                        score += if seek_heal { 130.0 } else { 72.0 };
-                    } else if future_los == 1 && !seek_heal {
-                        score += 110.0;
-                    } else {
-                        score -= (future_los as f64) * 65.0;
+                if in_combat {
+                    let mut future_los = 0_usize;
+                    for &te in &visible_threat_eyes {
+                        if self.world.raycast_solid(te, cand_eye).is_none() {
+                            future_los += 1;
+                        }
                     }
-                    if self.nav.is_near_cover(lx, ly) {
-                        score += 18.0;
-                    }
-                } else if let Some(pm) = primary_mech {
-                    let to_x = pm.pos[0] - pos[0];
-                    let to_y = pm.pos[1] - pos[1];
-                    let d = (to_x * to_x + to_y * to_y).sqrt().max(1.0);
-                    let sx = -(to_y / d) * self.strafe_sign;
-                    let sy = (to_x / d) * self.strafe_sign;
 
-                    score += (ux * sx + uy * sy) * 46.0;
-
-                    let new_d = ((pm.pos[0] - lx).powi(2) + (pm.pos[1] - ly).powi(2)).sqrt();
-                    score += ((d - ideal_dist).abs() - (new_d - ideal_dist).abs()) * 4.5;
-
-                    if duck_on_cooldown {
+                    if seek_heal || los_enemies >= 2 {
+                        score += (ux * escape_dir[0] + uy * escape_dir[1]) * 26.0;
                         if future_los == 0 {
-                            score += 75.0;
+                            score += if seek_heal { 130.0 } else { 72.0 };
+                        } else if future_los == 1 && !seek_heal {
+                            score += 110.0;
+                        } else {
+                            score -= (future_los as f64) * 65.0;
                         }
                         if self.nav.is_near_cover(lx, ly) {
                             score += 18.0;
                         }
-                    } else if future_los == 1 {
-                        score += 20.0;
+                    } else if let Some(pm) = primary_mech {
+                        let to_x = pm.pos[0] - pos[0];
+                        let to_y = pm.pos[1] - pos[1];
+                        let d = (to_x * to_x + to_y * to_y).sqrt().max(1.0);
+                        let sx = -(to_y / d) * self.strafe_sign;
+                        let sy = (to_x / d) * self.strafe_sign;
+
+                        score += (ux * sx + uy * sy) * 46.0;
+
+                        let new_d = ((pm.pos[0] - lx).powi(2) + (pm.pos[1] - ly).powi(2)).sqrt();
+                        score += ((d - ideal_dist).abs() - (new_d - ideal_dist).abs()) * 4.5;
+
+                        // Soft corner slicing: bias strafe side to keep flankers behind walls
+                        if !secondary_eyes.is_empty() && !duck_on_cooldown {
+                            let flank_los = secondary_eyes
+                                .iter()
+                                .filter(|&&se| self.world.raycast_solid(se, cand_eye).is_none())
+                                .count();
+                            if flank_los == 0 && future_los == 1 {
+                                score += 28.0;
+                            } else if flank_los > 0 {
+                                score -= (flank_los as f64) * 20.0;
+                            }
+                        }
+
+                        if duck_on_cooldown {
+                            if future_los == 0 {
+                                score += 75.0;
+                            }
+                            if self.nav.is_near_cover(lx, ly) {
+                                score += 18.0;
+                            }
+                        } else if future_los == 1 {
+                            score += 20.0;
+                        }
                     }
                 }
             }
@@ -1011,7 +1037,13 @@ impl BotBrain {
 
         act.move_dir = [best_yaw.cos() * mag, best_yaw.sin() * mag];
 
-        let min_boost_energy = if has_lightning { 38.0 } else { 20.0 };
+        let min_boost_energy = if urgent_dodge || !obs.me.in_zone {
+            6.0
+        } else if has_lightning {
+            38.0
+        } else {
+            20.0
+        };
         let early_loot_sprint =
             !in_combat && obs.me.cubes < self.cfg.cube_stat_cap && obs.me.energy > 72.0;
         let need_sprint = urgent_dodge
