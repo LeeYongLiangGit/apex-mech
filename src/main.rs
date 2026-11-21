@@ -20,12 +20,13 @@ struct BotBrain {
     last_aim: [f64; 2],
     last_target_id: Option<u64>,
     laser_last_los_t: f64,
+    healing_active: bool,
     strafe_sign: f64,
     last_strafe_flip: u64,
     climb_stuck_ticks: u32,
     last_pos: [f64; 3],
     stuck_ticks: u32,
-    escape_cache: Option<([f64; 3], u64)>,
+    escape_cache: Option<([f64; 3], u64, bool)>,
 }
 
 impl BotBrain {
@@ -39,6 +40,7 @@ impl BotBrain {
             last_aim: [0.0, 0.0],
             last_target_id: None,
             laser_last_los_t: -10.0,
+            healing_active: false,
             strafe_sign: 1.0,
             last_strafe_flip: 0,
             climb_stuck_ticks: 0,
@@ -82,7 +84,35 @@ impl BotBrain {
         self.last_target_id = target.as_ref().filter(|t| t.is_mech).map(|t| t.id);
 
         let hp_frac = obs.me.hp / obs.me.max_hp.max(1.0);
-        let seek_heal = hp_frac < 0.48 && obs.me.in_zone;
+        let finishing_1v1 = los_enemies == 1
+            && hp_frac > 0.30
+            && target
+                .as_ref()
+                .map_or(false, |t| t.is_mech && t.los && t.hp <= 220.0);
+
+        let enter_heal = obs.me.in_zone
+            && !finishing_1v1
+            && match los_enemies {
+                0 => hp_frac < 0.48,
+                1 => hp_frac < 0.52,
+                2 => hp_frac < 0.72,
+                _ => hp_frac < 0.88,
+            };
+
+        if !obs.me.in_zone {
+            self.healing_active = false;
+        } else if enter_heal {
+            self.healing_active = true;
+        } else if self.healing_active {
+            let exit_hp = if los_enemies == 0 { 0.74 } else { 0.64 };
+            if hp_frac >= exit_hp || finishing_1v1 {
+                self.healing_active = false;
+            }
+        }
+
+        let seek_heal = self.healing_active && obs.me.in_zone;
+        let isolate_multi = los_enemies >= 2 && obs.me.in_zone && !seek_heal;
+
         let ceasefire_for_regen = hp_frac < 0.80
             && obs.me.in_zone
             && los_enemies == 0
@@ -109,6 +139,7 @@ impl BotBrain {
             target.as_ref(),
             los_enemies,
             seek_heal,
+            isolate_multi,
             dodge,
             urgent_dodge,
             &mut act,
@@ -450,7 +481,8 @@ impl BotBrain {
     }
 
     fn is_in_safe_next_zone(&self, x: f64, y: f64, obs: &ObsMsg, margin: f64) -> bool {
-        let d = ((x - obs.zone.next_center[0]).powi(2) + (y - obs.zone.next_center[1]).powi(2)).sqrt();
+        let d = ((x - obs.zone.next_center[0]).powi(2) + (y - obs.zone.next_center[1]).powi(2))
+            .sqrt();
         d <= (obs.zone.next_radius - margin).max(4.0)
     }
 
@@ -461,6 +493,7 @@ impl BotBrain {
         visible_threat_eyes: &[[f64; 3]],
         los_enemies: usize,
         seek_heal: bool,
+        isolate_multi: bool,
     ) -> [f64; 3] {
         let pos = obs.me.pos;
         let next_z = [
@@ -477,30 +510,59 @@ impl BotBrain {
             || (dist_next > (obs.zone.next_radius - 16.0).max(5.0)
                 && (time_to_shrink < 16.0 || obs.zone.dps >= 60.0));
         if must_rotate {
+            self.escape_cache = None;
             return next_z;
         }
 
-        // 2. Ground-only building-corner escape ONLY when critically low HP under LOS fire
-        if seek_heal && los_enemies > 0 && !visible_threat_eyes.is_empty() {
-            let reuse = self
-                .escape_cache
-                .filter(|&(pt, tick)| obs.tick.saturating_sub(tick) < 6 && dist_2d(pos, pt) > 6.0);
-            if let Some((pt, _)) = reuse {
+        // 2. Ground-only building-corner disengage under low HP OR multi-bot focus (2+ LOS)
+        let disengaging = (seek_heal && los_enemies > 0) || isolate_multi;
+        if disengaging && !visible_threat_eyes.is_empty() {
+            let want_zero_los = seek_heal;
+            let reuse = self.escape_cache.filter(|&(pt, tick, cached_zero)| {
+                if cached_zero != want_zero_los
+                    || obs.tick.saturating_sub(tick) >= 8
+                    || dist_2d(pos, pt) <= 5.0
+                {
+                    return false;
+                }
+                let dz = ((pt[0] - obs.zone.center[0]).powi(2)
+                    + (pt[1] - obs.zone.center[1]).powi(2))
+                .sqrt();
+                if dz > (obs.zone.radius - 6.0).max(4.0) {
+                    return false;
+                }
+                let cand_eye = [pt[0], pt[1], pt[2] + obs.me.eye_height()];
+                let max_ok = if want_zero_los { 0 } else { 1 };
+                let mut los_cnt = 0_usize;
+                for &te in visible_threat_eyes {
+                    if self.world.raycast_solid(te, cand_eye).is_none() {
+                        los_cnt += 1;
+                        if los_cnt > max_ok {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            if let Some((pt, _, _)) = reuse {
                 return pt;
             }
+
             let esc_dir = self.belief.escape_vector(pos, obs.t);
             if let Some(cover_pt) = self.nav.find_escape_cover(
                 pos,
                 obs.me.eye_height(),
                 visible_threat_eyes,
                 esc_dir,
-                true,
+                want_zero_los,
                 false, // Never jet-climb mid-combat
                 &self.world,
                 obs.zone.center,
                 obs.zone.radius,
+                obs.zone.next_center,
+                obs.zone.next_radius,
             ) {
-                self.escape_cache = Some((cover_pt, obs.tick));
+                self.escape_cache = Some((cover_pt, obs.tick, want_zero_los));
                 return cover_pt;
             }
         } else {
@@ -623,7 +685,8 @@ impl BotBrain {
 
         // 6. Mode-specific mid/late objective
         if self.belief.mode == MatchMode::PracticeHivemind
-            && obs.me.hp / obs.me.max_hp.max(1.0) > 0.62
+            && !seek_heal
+            && obs.me.hp / obs.me.max_hp.max(1.0) > 0.68
         {
             if let Some(t) = target {
                 if t.is_mech {
@@ -653,6 +716,7 @@ impl BotBrain {
         target: Option<&TargetInfo>,
         los_enemies: usize,
         seek_heal: bool,
+        isolate_multi: bool,
         dodge: [f64; 2],
         urgent_dodge: bool,
         act: &mut Action,
@@ -661,6 +725,8 @@ impl BotBrain {
         let radius = obs.me.radius();
         let height = obs.me.height();
         let my_eye_off = obs.me.eye_height();
+        let my_eye = [pos[0], pos[1], pos[2] + my_eye_off];
+        let on_roof = pos[2] > self.world.terrain_height(pos[0], pos[1]) + 2.5;
 
         let has_lightning = obs
             .me
@@ -672,29 +738,46 @@ impl BotBrain {
             .weapons
             .iter()
             .any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
+        let laser_charging = obs
+            .me
+            .weapons
+            .iter()
+            .flatten()
+            .any(|w| w.kind == "laser" && w.charge > 0.0);
 
         if obs.tick.saturating_sub(self.last_strafe_flip) >= 18 {
             self.strafe_sign = -self.strafe_sign;
             self.last_strafe_flip = obs.tick;
         }
 
-        // Strictly currently-visible enemy mechs (top 4 closest) for combat steering
-        let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
+        // Prioritize active LOS shooters (up to 210 m), then closest tracked mechs (top 4)
+        let mut vis_enemies: Vec<(bool, f64, [f64; 3])> = obs
             .mechs
             .iter()
             .filter(|m| m.kind == "mech")
             .map(|m| {
                 let d2 = (m.pos[0] - pos[0]).powi(2) + (m.pos[1] - pos[1]).powi(2);
                 let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * m.cubes as f64);
-                (d2, [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h])
+                let te = [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h];
+                let has_los =
+                    d2 <= 210.0 * 210.0 && self.world.raycast_solid(my_eye, te).is_none();
+                (has_los, d2, te)
             })
-            .filter(|(d2, _)| *d2 <= 155.0 * 155.0)
+            .filter(|&(has_los, d2, _)| has_los || d2 <= 155.0 * 155.0)
             .collect();
-        vis_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
+        vis_enemies.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.total_cmp(&b.1)));
         vis_enemies.truncate(4);
-        let visible_threat_eyes: Vec<[f64; 3]> = vis_enemies.into_iter().map(|(_, p)| p).collect();
+        let visible_threat_eyes: Vec<[f64; 3]> =
+            vis_enemies.into_iter().map(|(_, _, p)| p).collect();
 
-        let goal = self.choose_macro_goal(obs, target, &visible_threat_eyes, los_enemies, seek_heal);
+        let goal = self.choose_macro_goal(
+            obs,
+            target,
+            &visible_threat_eyes,
+            los_enemies,
+            seek_heal,
+            isolate_multi,
+        );
         let allow_jet = self.belief.mode == MatchMode::FfaSurvival
             && los_enemies == 0
             && obs.me.energy >= 65.0
@@ -746,13 +829,14 @@ impl BotBrain {
         };
 
         let in_combat = !visible_threat_eyes.is_empty();
+        let disengaging = (seek_heal && los_enemies > 0) || isolate_multi;
         let primary_mech = target.filter(|t| t.is_mech);
         let escape_dir = self.belief.escape_vector(pos, obs.t);
 
         // Stay at the edge of lightning range (37m) for max bullet-dodging space
         let ideal_dist = if let Some(pm) = primary_mech {
-            if seek_heal || los_enemies >= 2 {
-                90.0
+            if disengaging {
+                95.0
             } else if has_lightning && obs.me.energy >= 20.0 && !pm.has_mortar {
                 37.0
             } else if pm.has_lightning && !has_lightning {
@@ -768,6 +852,7 @@ impl BotBrain {
 
         let mut best_yaw = nav_dy.atan2(nav_dx);
         let mut best_score = f64::NEG_INFINITY;
+        let pos_mid = [pos[0], pos[1], pos[2] + 3.0];
 
         for k in 0..16 {
             let yaw = (k as f64) * (2.0 * PI / 16.0);
@@ -804,7 +889,8 @@ impl BotBrain {
 
             let lx = pos[0] + ux * 10.0;
             let ly = pos[1] + uy * 10.0;
-            let d_cur_z = ((lx - obs.zone.center[0]).powi(2) + (ly - obs.zone.center[1]).powi(2)).sqrt();
+            let d_cur_z = ((lx - obs.zone.center[0]).powi(2) + (ly - obs.zone.center[1]).powi(2))
+                .sqrt();
             if d_cur_z > obs.zone.radius - 4.0 {
                 score -= 220.0;
             } else if !obs.me.in_zone {
@@ -822,8 +908,8 @@ impl BotBrain {
             let nav_dot = ux * nav_u[0] + uy * nav_u[1];
             let nav_weight = if !obs.me.in_zone {
                 95.0
-            } else if seek_heal && self.escape_cache.is_some() {
-                48.0
+            } else if disengaging && self.escape_cache.is_some() {
+                if seek_heal { 78.0 } else { 64.0 }
             } else if in_combat {
                 22.0
             } else {
@@ -832,7 +918,12 @@ impl BotBrain {
             score += nav_dot * nav_weight;
 
             if in_combat && ok_near {
-                let cand_eye = [lx, ly, pos[2] + my_eye_off];
+                let lz = if on_roof {
+                    pos[2]
+                } else {
+                    self.world.terrain_height(lx, ly)
+                };
+                let cand_eye = [lx, ly, lz + my_eye_off];
                 let mut future_los = 0_usize;
                 for &te in &visible_threat_eyes {
                     if self.world.raycast_solid(te, cand_eye).is_none() {
@@ -840,17 +931,66 @@ impl BotBrain {
                     }
                 }
 
-                if seek_heal || los_enemies >= 2 {
-                    score += (ux * escape_dir[0] + uy * escape_dir[1]) * 26.0;
+                if disengaging {
+                    score += (ux * escape_dir[0] + uy * escape_dir[1]) * 30.0;
                     if future_los == 0 {
-                        score += if seek_heal { 130.0 } else { 72.0 };
+                        score += if seek_heal { 135.0 } else { 85.0 };
                     } else if future_los == 1 && !seek_heal {
-                        score += 110.0;
+                        score += 115.0;
                     } else {
                         score -= (future_los as f64) * 65.0;
+
+                        // Extended 18 m cover lookahead when 10 m doesn't yet break LOS
+                        if ok_far {
+                            let lx2 = pos[0] + ux * 18.0;
+                            let ly2 = pos[1] + uy * 18.0;
+                            let d_z2 = ((lx2 - obs.zone.center[0]).powi(2)
+                                + (ly2 - obs.zone.center[1]).powi(2))
+                            .sqrt();
+                            if d_z2 <= obs.zone.radius - 4.0 {
+                                let lz2 = if on_roof {
+                                    pos[2]
+                                } else {
+                                    self.world.terrain_height(lx2, ly2)
+                                };
+                                let ok_mid = self.world.is_walkable_step(
+                                    [pos[0] + ux * 7.0, pos[1] + uy * 7.0, lz],
+                                    pos[0] + ux * 13.5,
+                                    pos[1] + uy * 13.5,
+                                    radius + 0.2,
+                                    height,
+                                    self.cfg.step_up,
+                                    self.cfg.max_slope_deg,
+                                );
+                                if ok_mid
+                                    && self
+                                        .world
+                                        .raycast_solid(pos_mid, [lx2, ly2, lz2 + 3.0])
+                                        .is_none()
+                                {
+                                    let cand_eye2 = [lx2, ly2, lz2 + my_eye_off];
+                                    let mut far_los = 0_usize;
+                                    for &te in &visible_threat_eyes {
+                                        if self.world.raycast_solid(te, cand_eye2).is_none() {
+                                            far_los += 1;
+                                        }
+                                    }
+                                    if far_los == 0 {
+                                        score += if seek_heal { 95.0 } else { 62.0 };
+                                    } else if far_los == 1 && !seek_heal {
+                                        score += 82.0;
+                                    } else if far_los < future_los {
+                                        score += ((future_los - far_los) as f64) * 35.0;
+                                    }
+                                    if self.nav.is_near_cover(lx2, ly2) {
+                                        score += 14.0;
+                                    }
+                                }
+                            }
+                        }
                     }
                     if self.nav.is_near_cover(lx, ly) {
-                        score += 18.0;
+                        score += 20.0;
                     }
                 } else if let Some(pm) = primary_mech {
                     let to_x = pm.pos[0] - pos[0];
@@ -865,7 +1005,9 @@ impl BotBrain {
                     score += ((d - ideal_dist).abs() - (new_d - ideal_dist).abs()) * 4.5;
 
                     if future_los == 1 {
-                        score += 20.0;
+                        score += 25.0;
+                    } else if future_los >= 2 {
+                        score -= (future_los as f64) * 55.0;
                     }
                 }
             }
@@ -906,14 +1048,23 @@ impl BotBrain {
 
         act.move_dir = [best_yaw.cos() * mag, best_yaw.sin() * mag];
 
-        let min_boost_energy = if has_lightning { 38.0 } else { 20.0 };
+        let min_boost_energy = if disengaging {
+            if has_lightning { 22.0 } else { 12.0 }
+        } else if has_lightning {
+            38.0
+        } else {
+            20.0
+        };
         let early_loot_sprint =
             !in_combat && obs.me.cubes < self.cfg.cube_stat_cap && obs.me.energy > 72.0;
         let need_sprint = urgent_dodge
             || !obs.me.in_zone
-            || (seek_heal && los_enemies > 0)
+            || disengaging
             || early_loot_sprint;
-        act.boost = need_sprint && obs.me.grounded && obs.me.energy >= min_boost_energy;
+        act.boost = need_sprint
+            && !laser_charging
+            && obs.me.grounded
+            && obs.me.energy >= min_boost_energy;
     }
 }
 
