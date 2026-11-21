@@ -25,7 +25,7 @@ struct BotBrain {
     climb_stuck_ticks: u32,
     last_pos: [f64; 3],
     stuck_ticks: u32,
-    escape_cache: Option<([f64; 3], u64)>,
+    escape_cache: Option<([f64; 3], u64, bool)>,
 }
 
 impl BotBrain {
@@ -465,6 +465,7 @@ impl BotBrain {
         visible_threat_eyes: &[[f64; 3]],
         los_enemies: usize,
         seek_heal: bool,
+        can_roof_loot: bool,
     ) -> [f64; 3] {
         let pos = obs.me.pos;
         let next_z = [
@@ -484,36 +485,35 @@ impl BotBrain {
             return next_z;
         }
 
-        // 2. Ground-only building-corner escape ONLY when critically low HP (<48%) under LOS fire
-        if seek_heal && los_enemies > 0 && !visible_threat_eyes.is_empty() {
-            let safe_z_r = (obs.zone.radius - 6.0).max(6.0);
-            let my_eye_off = obs.me.eye_height();
-            let reuse = self.escape_cache.filter(|&(pt, tick)| {
-                if obs.tick.saturating_sub(tick) >= 6 || dist_2d(pos, pt) <= 6.0 {
+        // 2. Ground-only cover: full break-LOS when critically low (<48% HP),
+        //    or 1v1 corner slicing (want_zero_los = false) when exposed to >=2 LOS bots.
+        let need_cover = (seek_heal && los_enemies > 0) || los_enemies >= 2;
+        if need_cover && !visible_threat_eyes.is_empty() {
+            let want_zero_los = seek_heal;
+            let safe_z_r = (obs.zone.radius - 5.0).max(5.0);
+            let reuse = self.escape_cache.filter(|&(pt, tick, cached_zero)| {
+                if cached_zero != want_zero_los
+                    || obs.tick.saturating_sub(tick) >= 6
+                    || dist_2d(pos, pt) <= 6.0
+                {
                     return false;
                 }
                 let d_zone = ((pt[0] - obs.zone.center[0]).powi(2)
                     + (pt[1] - obs.zone.center[1]).powi(2))
                 .sqrt();
-                if d_zone > safe_z_r {
-                    return false;
-                }
-                let pt_eye = [pt[0], pt[1], pt[2] + my_eye_off];
-                visible_threat_eyes
-                    .iter()
-                    .all(|&te| self.world.raycast_solid(te, pt_eye).is_some())
+                d_zone <= safe_z_r
             });
-            if let Some((pt, _)) = reuse {
+            if let Some((pt, _, _)) = reuse {
                 return pt;
             }
             self.escape_cache = None;
             let esc_dir = self.belief.escape_vector(pos, obs.t);
             if let Some(cover_pt) = self.nav.find_escape_cover(
                 pos,
-                my_eye_off,
+                obs.me.eye_height(),
                 visible_threat_eyes,
                 esc_dir,
-                true,
+                want_zero_los,
                 false, // Never jet-climb mid-combat
                 &self.world,
                 obs.zone.center,
@@ -521,14 +521,19 @@ impl BotBrain {
                 obs.zone.next_center,
                 obs.zone.next_radius,
             ) {
-                self.escape_cache = Some((cover_pt, obs.tick));
+                self.escape_cache = Some((cover_pt, obs.tick, want_zero_los));
                 return cover_pt;
             }
         } else {
             self.escape_cache = None;
         }
 
-        // 3. Ground-level high-value weapon pickups (lightning / laser / mortar into empty slot)
+        // 3. High-value weapon pickups (ground always; low roofs <=14 m strictly out of combat)
+        let max_loot_dz = if can_roof_loot {
+            14.0
+        } else {
+            self.cfg.step_up + 1.5
+        };
         let next_hits_upgrade = self.cfg.upgrade_thresholds.contains(&(obs.me.cubes + 1));
         let empty_slot = obs.me.weapons.iter().any(|w| w.is_none());
         let best_pickup = obs
@@ -543,17 +548,22 @@ impl BotBrain {
                     .weapons
                     .iter()
                     .any(|w| w.as_ref().map_or(false, |s| s.kind == p.kind));
+                let dz = p.pos[2] - pos[2];
                 if already_have
-                    || (p.pos[2] - pos[2]) > self.cfg.step_up + 1.5
+                    || dz > max_loot_dz
                     || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 6.0)
                 {
                     return false;
                 }
+                let is_roof = dz > self.cfg.step_up + 1.5;
                 let prio = self.weapon_priority(&p.kind, obs);
+                if is_roof && (prio < 95 || dist_2d(pos, p.pos) > 65.0) {
+                    return false;
+                }
                 if empty_slot {
                     prio >= 80
                 } else {
-                    let can_swap = obs.me.weapons.iter().enumerate().take(2).any(|(idx, slot)| {
+                    obs.me.weapons.iter().enumerate().take(2).any(|(idx, slot)| {
                         let Some(w) = slot else { return false };
                         let other_kind = obs
                             .me
@@ -565,13 +575,14 @@ impl BotBrain {
                         let pair_ok =
                             other_kind.is_empty() || Self::valid_loadout_pair(&p.kind, other_kind);
                         pair_ok && prio > self.weapon_priority(&w.kind, obs) + 12
-                    });
-                    can_swap
+                    })
                 }
             })
             .min_by(|a, b| {
-                let sa = dist_2d(pos, a.pos) - self.weapon_priority(&a.kind, obs) as f64 * 0.6;
-                let sb = dist_2d(pos, b.pos) - self.weapon_priority(&b.kind, obs) as f64 * 0.6;
+                let ra = if (a.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 18.0 } else { 0.0 };
+                let rb = if (b.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 18.0 } else { 0.0 };
+                let sa = dist_2d(pos, a.pos) + ra - self.weapon_priority(&a.kind, obs) as f64 * 0.6;
+                let sb = dist_2d(pos, b.pos) + rb - self.weapon_priority(&b.kind, obs) as f64 * 0.6;
                 sa.total_cmp(&sb)
             });
 
@@ -582,7 +593,7 @@ impl BotBrain {
             }
         }
 
-        // 4. Supply drops (skip if contested by >=2 LOS mechs)
+        // 4. State-aware supply drops (check zone safety, enemy capture ETA, and active hold)
         let near_mechs = obs
             .mechs
             .iter()
@@ -590,7 +601,29 @@ impl BotBrain {
             .count();
         for d in &obs.drops {
             let dist = dist_2d(pos, d.pos);
+            let we_hold = d.holder == Some(obs.me.id);
+            let d_cur_z = ((d.pos[0] - obs.zone.center[0]).powi(2)
+                + (d.pos[1] - obs.zone.center[1]).powi(2))
+            .sqrt();
+            let in_next = self.is_in_safe_next_zone(d.pos[0], d.pos[1], obs, 4.0);
+            let safe_for_cap =
+                in_next || (d_cur_z <= obs.zone.radius - 8.0 && time_to_shrink > d.lands_in + d.capture_s + 4.0);
+            if !safe_for_cap {
+                continue;
+            }
+            if we_hold && obs.me.hp / obs.me.max_hp.max(1.0) > 0.35 && los_enemies <= 1 {
+                return d.pos;
+            }
             if d.lands_in <= 14.0 && dist < 140.0 && los_enemies <= 1 {
+                if let Some(holder) = d.holder {
+                    if holder != obs.me.id {
+                        let rem = (d.capture_s - d.progress).max(0.0);
+                        let eta = dist / 14.5;
+                        if rem + 0.5 < eta {
+                            continue;
+                        }
+                    }
+                }
                 if self.belief.mode != MatchMode::FfaSurvival || near_mechs == 0 {
                     return d.pos;
                 } else if dist > 45.0 {
@@ -601,7 +634,7 @@ impl BotBrain {
             }
         }
 
-        // 5. Fast 10-cube snowball: loose cubes > NPCs (2 cubes) > ground crates
+        // 5. Fast 10-cube snowball: loose cubes > NPCs (2 cubes) > crates (low roofs out of combat)
         let next_threshold_close = self
             .cfg
             .upgrade_thresholds
@@ -615,10 +648,16 @@ impl BotBrain {
                 .cubes
                 .iter()
                 .filter(|c| {
-                    (c.pos[2] - pos[2]) <= self.cfg.step_up + 1.5
-                        && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 5.0)
+                    let dz = c.pos[2] - pos[2];
+                    let roof_ok = dz <= self.cfg.step_up + 1.5
+                        || (dz <= max_loot_dz && dist_2d(pos, c.pos) <= 55.0);
+                    roof_ok && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 5.0)
                 })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
+                .min_by(|a, b| {
+                    let ra = if (a.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 18.0 } else { 0.0 };
+                    let rb = if (b.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 18.0 } else { 0.0 };
+                    (dist_2d(pos, a.pos) + ra).total_cmp(&(dist_2d(pos, b.pos) + rb))
+                })
             {
                 if dist_2d(pos, c.pos) < 85.0 {
                     return c.pos;
@@ -640,10 +679,16 @@ impl BotBrain {
                 .crates
                 .iter()
                 .filter(|c| {
-                    (c.pos[2] - pos[2]) <= self.cfg.step_up + 1.5
-                        && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 8.0)
+                    let dz = c.pos[2] - pos[2];
+                    let roof_ok = dz <= self.cfg.step_up + 1.5
+                        || (dz <= max_loot_dz && dist_2d(pos, c.pos) <= 55.0);
+                    roof_ok && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 8.0)
                 })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
+                .min_by(|a, b| {
+                    let ra = if (a.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 20.0 } else { 0.0 };
+                    let rb = if (b.pos[2] - pos[2]) > self.cfg.step_up + 1.5 { 20.0 } else { 0.0 };
+                    (dist_2d(pos, a.pos) + ra).total_cmp(&(dist_2d(pos, b.pos) + rb))
+                })
             {
                 if dist_2d(pos, cr.pos) < 75.0 {
                     return cr.pos;
@@ -709,7 +754,7 @@ impl BotBrain {
             self.last_strafe_flip = obs.tick;
         }
 
-        // Strictly currently-visible enemy mechs (top 4 closest up to 260 m) for combat steering
+        // Strictly currently-visible enemy mechs within 155 m (top 4 closest) for combat steering
         let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
             .mechs
             .iter()
@@ -719,17 +764,36 @@ impl BotBrain {
                 let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * m.cubes as f64);
                 (d2, [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h])
             })
-            .filter(|(d2, _)| *d2 <= 260.0 * 260.0)
+            .filter(|(d2, _)| *d2 <= 155.0 * 155.0)
             .collect();
         vis_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
         vis_enemies.truncate(4);
         let visible_threat_eyes: Vec<[f64; 3]> = vis_enemies.into_iter().map(|(_, p)| p).collect();
 
-        let goal = self.choose_macro_goal(obs, target, &visible_threat_eyes, los_enemies, seek_heal);
-        let allow_jet = self.belief.mode == MatchMode::FfaSurvival
+        let in_combat = !visible_threat_eyes.is_empty();
+        let jet_energy_ok = if obs.me.grounded {
+            obs.me.energy >= 68.0
+        } else {
+            obs.me.energy >= 25.0
+        };
+        let can_roof_loot = los_enemies == 0 && !in_combat && !seek_heal && !urgent_dodge && jet_energy_ok;
+
+        let goal = self.choose_macro_goal(
+            obs,
+            target,
+            &visible_threat_eyes,
+            los_enemies,
+            seek_heal,
+            can_roof_loot,
+        );
+        let roof_loot_climb = can_roof_loot
+            && (goal[2] - pos[2]) > self.cfg.step_up + 0.5
+            && (goal[2] - pos[2]) <= 14.5;
+        let allow_jet = (self.belief.mode == MatchMode::FfaSurvival
             && los_enemies == 0
-            && obs.me.energy >= 65.0
-            && !urgent_dodge;
+            && jet_energy_ok
+            && !urgent_dodge)
+            || roof_loot_climb;
         let wp = self.nav.next_waypoint(obs.tick, pos, goal, allow_jet);
 
         let climbing = allow_jet
@@ -776,9 +840,15 @@ impl BotBrain {
             [0.0, 0.0]
         };
 
-        let in_combat = !visible_threat_eyes.is_empty();
         let primary_mech = target.filter(|t| t.is_mech);
         let escape_dir = self.belief.escape_vector(pos, obs.t);
+
+        let active_drop = obs.drops.iter().find(|d| {
+            d.holder == Some(obs.me.id)
+                && d.lands_in <= 0.1
+                && obs.me.hp / obs.me.max_hp.max(1.0) > 0.35
+                && los_enemies <= 1
+        });
 
         // Corner peek-out unit vector when pre-charging laser behind cover
         let peek_u = peek_point.and_then(|pk| {
@@ -870,6 +940,15 @@ impl BotBrain {
                 score -= d_next_z * 2.5;
             }
 
+            if let Some(d) = active_drop {
+                let sx4 = pos[0] + ux * 4.0;
+                let sy4 = pos[1] + uy * 4.0;
+                let d_ring = ((sx4 - d.pos[0]).powi(2) + (sy4 - d.pos[1]).powi(2)).sqrt();
+                if !urgent_dodge && d_ring > (d.radius - 1.0).max(2.0) {
+                    score -= 75.0;
+                }
+            }
+
             if dodge_len > 0.05 {
                 score += (ux * dodge_u[0] + uy * dodge_u[1])
                     * if urgent_dodge { 155.0 } else { 78.0 };
@@ -885,6 +964,8 @@ impl BotBrain {
                 95.0
             } else if seek_heal && self.escape_cache.is_some() {
                 48.0
+            } else if los_enemies >= 2 && self.escape_cache.is_some() {
+                30.0
             } else if in_combat {
                 22.0
             } else {

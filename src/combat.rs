@@ -379,7 +379,7 @@ pub fn select_target(
         .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
 
     let mut candidates: Vec<TargetInfo> = Vec::with_capacity(obs.mechs.len());
-    let mut los_mech_bearings_120: Vec<f64> = Vec::with_capacity(8);
+    let mut los_mech_bearings_85: Vec<f64> = Vec::with_capacity(8);
 
     for m in &obs.mechs {
         let is_mech = m.kind == "mech";
@@ -399,9 +399,9 @@ pub fn select_target(
         };
 
         let d = dist_3d(muzzle, aim_pt);
-        if is_mech && los && d <= 120.0 {
+        if is_mech && los && d <= 85.0 {
             let b = (m.pos[1] - obs.me.pos[1]).atan2(m.pos[0] - obs.me.pos[0]);
-            los_mech_bearings_120.push(b);
+            los_mech_bearings_85.push(b);
         }
         if !los && d > 195.0 {
             continue;
@@ -465,17 +465,17 @@ pub fn select_target(
         });
     }
 
-    let has_los_mech_120 = !los_mech_bearings_120.is_empty();
+    let has_los_mech_85 = !los_mech_bearings_85.is_empty();
     let mut best: Option<TargetInfo> = None;
 
     for c in candidates {
-        // Front-armor guard: avoid turning >75 deg away from any LOS enemy mech within 120 m
-        // for out-of-LOS mortars or NPCs (prevents 1.5x rear damage).
-        if has_los_mech_120 && (!c.los || !c.is_mech) {
+        // Front-armor guard: avoid exposing the 1.5x rear arc (>88 deg) to a close (<85 m)
+        // LOS enemy mech just to fire at an out-of-LOS target or NPC.
+        if has_los_mech_85 && (!c.los || !c.is_mech) {
             let cand_yaw = (c.pos[1] - obs.me.pos[1]).atan2(c.pos[0] - obs.me.pos[0]);
-            let exposes_rear = los_mech_bearings_120
+            let exposes_rear = los_mech_bearings_85
                 .iter()
-                .any(|&tb| angle_diff(cand_yaw, tb).abs() > PI * 0.42);
+                .any(|&tb| angle_diff(cand_yaw, tb).abs() > PI * 0.49);
             if exposes_rear {
                 continue;
             }
@@ -486,7 +486,7 @@ pub fn select_target(
     }
 
     let want_crates = obs.me.cubes < cfg.cube_stat_cap;
-    if want_crates && !has_los_mech_120 {
+    if want_crates && !has_los_mech_85 {
         for c in &obs.crates {
             let pt = [c.pos[0], c.pos[1], c.pos[2] + 1.5];
             let d = dist_3d(muzzle, pt);
@@ -665,11 +665,15 @@ pub fn decide_combat(
         let base_dmg = w.stat_f64("damage", 315.0);
         let hold_s = w.stat_f64("hold_s", 2.0);
 
+        let gun_reloading = gun_slot.map_or(false, |(_, g)| g.reload > 0.35);
+        let laser_range_ok = t.dist > 45.0
+            || !has_close_weapon
+            || (lightning_slot.is_none() && gun_reloading && t.dist > 22.0);
         let multi_enemy_ok = los_enemies <= 1 || t.has_mortar || t.dist > 50.0;
         let safe_los_charge = !t.is_crate
             && t.los
             && t.dist <= range
-            && (t.dist > 45.0 || !has_close_weapon)
+            && laser_range_ok
             && multi_enemy_ok
             && !urgent_dodge;
 
@@ -682,7 +686,7 @@ pub fn decide_combat(
             // Laser fires on release using current aim; check actual obs.me.aim alignment
             let yaw_err = angle_diff(obs.me.aim[0], direct_aim[0]).abs();
             let pitch_err = (obs.me.aim[1] - direct_aim[1]).abs();
-            let hit_tol = (2.7 / t.dist.max(8.0)).clamp(0.035, 0.17);
+            let hit_tol = (2.15 / t.dist.max(8.0)).clamp(0.014, 0.16);
             let aligned = yaw_err <= hit_tol && pitch_err <= hit_tol;
 
             let dir = aim_dir(obs.me.aim);
@@ -813,7 +817,7 @@ pub fn decide_combat(
             let pred = predict_aim_after_step(obs.me.aim, lead, turn_rate, pitch_rate);
             let yaw_err = angle_diff(pred[0], lead[0]).abs();
             let pitch_err = (pred[1] - lead[1]).abs();
-            let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
+            let hit_tol = (2.9 / t.dist.max(6.0)).clamp(0.018, 0.25);
 
             let dir = aim_dir(pred);
             let barrel_tip = [
