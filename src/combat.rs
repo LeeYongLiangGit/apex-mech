@@ -281,14 +281,20 @@ pub fn select_target(
         let bearing_from_enemy = (obs.me.pos[1] - m.pos[1]).atan2(obs.me.pos[0] - m.pos[0]);
         let rear_exposed = angle_diff(m.aim[0], bearing_from_enemy).abs() > PI * 0.52;
 
-        let mut score = if is_mech { 1050.0 } else { 440.0 } - d * 2.6;
+        let mut score = if is_mech {
+            1060.0
+        } else if obs.me.cubes < cfg.cube_stat_cap {
+            580.0
+        } else {
+            340.0
+        } - d * 2.6;
+
         score += (1400.0 - hp).max(0.0) * 0.90;
         if is_mech && hp <= 420.0 {
-            score += 290.0;
+            score += 310.0;
         }
-        // Kill-focus hysteresis: finish our current mech target before switching
         if prev_target_id == Some(m.id as u64) && los {
-            score += 130.0;
+            score += 140.0;
         }
         if has_lightning && d <= 44.0 && los {
             score += 240.0;
@@ -300,16 +306,13 @@ pub fn select_target(
             score += if has_lightning && d <= 45.0 { 460.0 } else { 200.0 };
         }
         if has_laser && enemy_mortar && los {
-            score += 210.0;
+            score += 220.0;
         }
         if !los {
             score -= if has_mortar && d <= 200.0 { 160.0 } else { 520.0 };
         }
         if mode == MatchMode::FfaSurvival && is_mech && d > 85.0 && hp > 950.0 && !rear_exposed {
             score -= 360.0;
-        }
-        if !is_mech && obs.me.cubes >= cfg.cube_stat_cap {
-            score -= 320.0;
         }
 
         if best.as_ref().map_or(true, |b| score > b.score) {
@@ -369,6 +372,7 @@ pub fn decide_combat(
     cfg: &RuleConfig,
     world: &World,
     mode: MatchMode,
+    los_enemies: usize,
     ceasefire_for_regen: bool,
     urgent_dodge: bool,
     target: Option<&TargetInfo>,
@@ -438,12 +442,12 @@ pub fn decide_combat(
     let gun_slot = find_slot("gun");
     let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
 
-    // 1. Lightning inside range (240 guaranteed DPS + AoE chain + enemy laser interrupt)
+    // 1. Lightning inside range (240 guaranteed DPS + chain + laser short)
     if let Some((i, w)) = lightning_slot {
         let range = w.stat_f64("range", 45.0);
         let cone = w.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
         let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
-        if t.los && t.dist <= range - 0.6 && obs.me.energy >= energy_min {
+        if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
             act.aim = direct_aim;
             let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate);
             if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
@@ -453,7 +457,7 @@ pub fn decide_combat(
         }
     }
 
-    // 2. Laser (pre-charge behind corners on close wallhacked targets, or mid/long range burst)
+    // 2. Laser: never pre-charge out of LOS, avoid 50% speed penalty under multi-bot fire
     if let Some((i, w)) = laser_slot {
         let range = w.stat_f64("range", 280.0);
         let full_charge = w.stat_f64("charge", 0.75);
@@ -463,8 +467,10 @@ pub fn decide_combat(
         let hold_s = w.stat_f64("hold_s", 2.0);
 
         let safe_to_charge = !t.is_crate
+            && t.los
             && t.dist <= range
-            && (t.dist > 34.0 || !has_close_weapon || !t.los)
+            && (t.dist > 45.0 || !has_close_weapon)
+            && (los_enemies <= 1 || t.has_mortar)
             && !urgent_dodge;
 
         if w.charge > 0.0 {
@@ -473,13 +479,13 @@ pub fn decide_combat(
             let expected_dmg = base_dmg * frac * cook_mult * cube_mult;
 
             act.aim = direct_aim;
-            let pred = predict_aim_after_step(obs.me.aim, direct_aim, turn_rate);
-            let yaw_err = angle_diff(pred[0], direct_aim[0]).abs();
-            let pitch_err = (pred[1] - direct_aim[1]).abs();
-            let hit_tol = (2.8 / t.dist.max(8.0)).clamp(0.038, 0.18);
+            // Laser fires on release using current aim; check actual obs.me.aim alignment
+            let yaw_err = angle_diff(obs.me.aim[0], direct_aim[0]).abs();
+            let pitch_err = (obs.me.aim[1] - direct_aim[1]).abs();
+            let hit_tol = (2.7 / t.dist.max(8.0)).clamp(0.035, 0.17);
             let aligned = yaw_err <= hit_tol && pitch_err <= hit_tol;
 
-            let dir = aim_dir(pred);
+            let dir = aim_dir(obs.me.aim);
             let barrel_tip = [
                 muzzle[0] + dir[0] * (obs.me.radius() + 0.5),
                 muzzle[1] + dir[1] * (obs.me.radius() + 0.5),
@@ -487,27 +493,24 @@ pub fn decide_combat(
             ];
             let barrel_clear = world.raycast_solid(muzzle, barrel_tip).is_none();
 
-            let ready = w.charge >= full_charge - 0.05
+            let ready = w.charge >= full_charge - 0.04
                 || (w.charge >= min_charge && expected_dmg >= t.hp * 1.02)
                 || (w.charge >= full_charge + hold_s - 0.25);
 
             if ready && t.los && aligned && barrel_clear {
-                act.fire[i] = false; // Release fires hitscan laser!
-                return;
-            } else if w.charge >= full_charge + hold_s - 0.20 || (urgent_dodge && t.dist < 25.0) {
                 act.fire[i] = false;
+                return;
+            } else if w.charge >= full_charge + hold_s - 0.20 || (urgent_dodge && t.dist < 32.0) || !t.los {
+                act.fire[i] = false; // Drop charge to regain full speed
                 return;
             } else {
                 act.fire[i] = true;
                 return;
             }
         } else if w.cooldown <= 0.0 && safe_to_charge {
-            // Start charging in LOS, or pre-charge behind cover when a mech is within 52 m
-            if t.los || (t.is_mech && t.dist < 52.0 && !ceasefire_for_regen) {
-                act.aim = direct_aim;
-                act.fire[i] = true;
-                return;
-            }
+            act.aim = direct_aim;
+            act.fire[i] = true;
+            return;
         }
     }
 
@@ -531,7 +534,7 @@ pub fn decide_combat(
         }
     }
 
-    // 4. Arm Gun (3D lead + predicted-slew gating + cover reload)
+    // 4. Arm Gun
     if let Some((i, w)) = gun_slot {
         let range = w.stat_f64("range", 230.0);
         let speed = w.stat_f64("speed", 252.0);
@@ -556,7 +559,7 @@ pub fn decide_combat(
             {
                 act.fire[i] = true;
             }
-        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 6 {
+        } else if w.reload <= 0.0 && w.ammo.unwrap_or(12) <= 5 {
             act.reload = true;
         }
     }
