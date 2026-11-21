@@ -116,6 +116,10 @@ pub fn solve_mortar(
     let barrel_off = obs.me.radius() + 0.5;
     let min_safe_dist = (splash_radius + 4.0).max(11.0);
 
+    let base_terrain_z = world.terrain_height(target_pos[0], target_pos[1]);
+    let target_on_roof = target_pos[2] > base_terrain_z + 3.5;
+    let z_above_ground = (target_pos[2] - base_terrain_z).clamp(0.5, 2.5);
+
     for high_arc in [false, true] {
         let mut pred = target_pos;
         let mut valid_pitch = None;
@@ -155,18 +159,24 @@ pub fn solve_mortar(
             }
             flight_t = (r / vx).clamp(0.1, 6.0);
             let lead_t = flight_t.min(1.85);
-            let cand = [
-                target_pos[0] + target_vel[0] * lead_t,
-                target_pos[1] + target_vel[1] * lead_t,
-                target_pos[2],
-            ];
+            let cx = target_pos[0] + target_vel[0] * lead_t;
+            let cy = target_pos[1] + target_vel[1] * lead_t;
+            let cz = if target_on_roof {
+                target_pos[2]
+            } else {
+                world.terrain_height(cx, cy) + z_above_ground
+            };
+            let cand = [cx, cy, cz];
             pred = if let Some(ht) = world.raycast_solid(target_pos, cand) {
                 let f = (ht - 0.1).max(0.0);
-                [
-                    target_pos[0] + (cand[0] - target_pos[0]) * f,
-                    target_pos[1] + (cand[1] - target_pos[1]) * f,
-                    target_pos[2],
-                ]
+                let px = target_pos[0] + (cand[0] - target_pos[0]) * f;
+                let py = target_pos[1] + (cand[1] - target_pos[1]) * f;
+                let pz = if target_on_roof {
+                    target_pos[2]
+                } else {
+                    world.terrain_height(px, py) + z_above_ground
+                };
+                [px, py, pz]
             } else {
                 cand
             };
@@ -368,7 +378,8 @@ pub fn select_target(
         .iter()
         .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
 
-    let mut best: Option<TargetInfo> = None;
+    let mut candidates: Vec<TargetInfo> = Vec::with_capacity(obs.mechs.len());
+    let mut los_mech_bearings_120: Vec<f64> = Vec::with_capacity(8);
 
     for m in &obs.mechs {
         let is_mech = m.kind == "mech";
@@ -388,6 +399,10 @@ pub fn select_target(
         };
 
         let d = dist_3d(muzzle, aim_pt);
+        if is_mech && los && d <= 120.0 {
+            let b = (m.pos[1] - obs.me.pos[1]).atan2(m.pos[0] - obs.me.pos[0]);
+            los_mech_bearings_120.push(b);
+        }
         if !los && d > 195.0 {
             continue;
         }
@@ -433,30 +448,45 @@ pub fn select_target(
             score -= 360.0;
         }
 
-        if best.as_ref().map_or(true, |b| score > b.score) {
-            best = Some(TargetInfo {
-                id: m.id as u64,
-                pos: aim_pt,
-                feet_z: m.pos[2],
-                vel: m.vel,
-                dist: d,
-                hp,
-                los,
-                is_mech,
-                is_crate: false,
-                has_mortar: enemy_mortar,
-                has_lightning: enemy_lightning,
-                enemy_charging: m.charging,
-                score,
-            });
+        candidates.push(TargetInfo {
+            id: m.id as u64,
+            pos: aim_pt,
+            feet_z: m.pos[2],
+            vel: m.vel,
+            dist: d,
+            hp,
+            los,
+            is_mech,
+            is_crate: false,
+            has_mortar: enemy_mortar,
+            has_lightning: enemy_lightning,
+            enemy_charging: m.charging,
+            score,
+        });
+    }
+
+    let has_los_mech_120 = !los_mech_bearings_120.is_empty();
+    let mut best: Option<TargetInfo> = None;
+
+    for c in candidates {
+        // Front-armor guard: avoid turning >75 deg away from any LOS enemy mech within 120 m
+        // for out-of-LOS mortars or NPCs (prevents 1.5x rear damage).
+        if has_los_mech_120 && (!c.los || !c.is_mech) {
+            let cand_yaw = (c.pos[1] - obs.me.pos[1]).atan2(c.pos[0] - obs.me.pos[0]);
+            let exposes_rear = los_mech_bearings_120
+                .iter()
+                .any(|&tb| angle_diff(cand_yaw, tb).abs() > PI * 0.42);
+            if exposes_rear {
+                continue;
+            }
+        }
+        if best.as_ref().map_or(true, |b| c.score > b.score) {
+            best = Some(c);
         }
     }
 
     let want_crates = obs.me.cubes < cfg.cube_stat_cap;
-    let active_mech_fight = best
-        .as_ref()
-        .map_or(false, |b| b.is_mech && b.los && b.dist < 85.0);
-    if want_crates && !active_mech_fight {
+    if want_crates && !has_los_mech_120 {
         for c in &obs.crates {
             let pt = [c.pos[0], c.pos[1], c.pos[2] + 1.5];
             let d = dist_3d(muzzle, pt);

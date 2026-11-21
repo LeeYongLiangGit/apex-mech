@@ -486,16 +486,31 @@ impl BotBrain {
 
         // 2. Ground-only building-corner escape ONLY when critically low HP (<48%) under LOS fire
         if seek_heal && los_enemies > 0 && !visible_threat_eyes.is_empty() {
-            let reuse = self
-                .escape_cache
-                .filter(|&(pt, tick)| obs.tick.saturating_sub(tick) < 6 && dist_2d(pos, pt) > 6.0);
+            let safe_z_r = (obs.zone.radius - 6.0).max(6.0);
+            let my_eye_off = obs.me.eye_height();
+            let reuse = self.escape_cache.filter(|&(pt, tick)| {
+                if obs.tick.saturating_sub(tick) >= 6 || dist_2d(pos, pt) <= 6.0 {
+                    return false;
+                }
+                let d_zone = ((pt[0] - obs.zone.center[0]).powi(2)
+                    + (pt[1] - obs.zone.center[1]).powi(2))
+                .sqrt();
+                if d_zone > safe_z_r {
+                    return false;
+                }
+                let pt_eye = [pt[0], pt[1], pt[2] + my_eye_off];
+                visible_threat_eyes
+                    .iter()
+                    .all(|&te| self.world.raycast_solid(te, pt_eye).is_some())
+            });
             if let Some((pt, _)) = reuse {
                 return pt;
             }
+            self.escape_cache = None;
             let esc_dir = self.belief.escape_vector(pos, obs.t);
             if let Some(cover_pt) = self.nav.find_escape_cover(
                 pos,
-                obs.me.eye_height(),
+                my_eye_off,
                 visible_threat_eyes,
                 esc_dir,
                 true,
@@ -677,6 +692,7 @@ impl BotBrain {
         let radius = obs.me.radius();
         let height = obs.me.height();
         let my_eye_off = obs.me.eye_height();
+        let on_roof = pos[2] > self.world.terrain_height(pos[0], pos[1]) + 2.5;
 
         let find_w = |k: &str| obs.me.weapons.iter().flatten().find(|w| w.kind == k);
         let lightning_w = find_w("lightning");
@@ -693,7 +709,7 @@ impl BotBrain {
             self.last_strafe_flip = obs.tick;
         }
 
-        // Strictly currently-visible enemy mechs (top 4 closest) for combat steering
+        // Strictly currently-visible enemy mechs (top 4 closest up to 260 m) for combat steering
         let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
             .mechs
             .iter()
@@ -703,7 +719,7 @@ impl BotBrain {
                 let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * m.cubes as f64);
                 (d2, [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h])
             })
-            .filter(|(d2, _)| *d2 <= 155.0 * 155.0)
+            .filter(|(d2, _)| *d2 <= 260.0 * 260.0)
             .collect();
         vis_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
         vis_enemies.truncate(4);
@@ -877,7 +893,12 @@ impl BotBrain {
             score += nav_dot * nav_weight;
 
             if in_combat && ok_near {
-                let cand_eye = [lx, ly, pos[2] + my_eye_off];
+                let cand_z = if on_roof {
+                    pos[2]
+                } else {
+                    self.world.terrain_height(lx, ly)
+                };
+                let cand_eye = [lx, ly, cand_z + my_eye_off];
                 let mut future_los = 0_usize;
                 for &te in &visible_threat_eyes {
                     if self.world.raycast_solid(te, cand_eye).is_none() {
