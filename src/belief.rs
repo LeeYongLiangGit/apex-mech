@@ -26,11 +26,19 @@ pub struct ThreatPing {
     pub weight: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RearHit {
+    pub by: Option<u32>,
+    pub bearing: Option<f64>,
+    pub t: f64,
+}
+
 pub struct BeliefMap {
     pub mode: MatchMode,
     pub last_combat_t: f64,
     pub last_damaged_t: f64,
     pub last_dmg_bearing: Option<(f64, f64)>,
+    pub last_rear_hit: Option<RearHit>,
     pub prev_alive: u32,
     pub our_kills: u32,
     pub tracked: Vec<TrackedMech>,
@@ -44,6 +52,7 @@ impl BeliefMap {
             last_combat_t: -10.0,
             last_damaged_t: -10.0,
             last_dmg_bearing: None,
+            last_rear_hit: None,
             prev_alive: 16,
             our_kills: 0,
             tracked: Vec::with_capacity(16),
@@ -58,6 +67,13 @@ impl BeliefMap {
                 "damaged" => {
                     self.last_combat_t = obs.t;
                     self.last_damaged_t = obs.t;
+                    if ev.rear == Some(true) {
+                        self.last_rear_hit = Some(RearHit {
+                            by: ev.by,
+                            bearing: ev.bearing,
+                            t: obs.t,
+                        });
+                    }
                     if let Some(b) = ev.bearing {
                         self.last_dmg_bearing = Some((b, obs.t));
                         let est = [
@@ -79,6 +95,13 @@ impl BeliefMap {
                     self.our_kills += 1;
                     if let Some(tid) = ev.target {
                         self.tracked.retain(|m| m.id as u64 != tid);
+                        if self
+                            .last_rear_hit
+                            .and_then(|rh| rh.by)
+                            .map_or(false, |id| id as u64 == tid)
+                        {
+                            self.last_rear_hit = None;
+                        }
                     }
                 }
                 _ => {}
@@ -182,6 +205,28 @@ impl BeliefMap {
             }
         }
         self.prev_alive = obs.alive;
+    }
+
+    pub fn recent_rear_attacker(&self, now: f64) -> Option<u32> {
+        let rh = self.last_rear_hit?;
+        if now - rh.t <= 1.2 {
+            rh.by
+        } else {
+            None
+        }
+    }
+
+    pub fn unseen_rear_snap_bearing(&self, obs: &ObsMsg) -> Option<f64> {
+        let rh = self.last_rear_hit?;
+        if obs.t - rh.t > 0.7 {
+            return None;
+        }
+        if let Some(by_id) = rh.by {
+            if obs.mechs.iter().any(|m| m.kind == "mech" && m.id == by_id) {
+                return None;
+            }
+        }
+        rh.bearing
     }
 
     /// Returns up to `max_n` closest active enemy eye positions (visible or seen < 4s ago).

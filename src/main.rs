@@ -73,12 +73,14 @@ impl BotBrain {
         let los_enemies = count_los_enemy_mechs(obs, &self.cfg, &self.world);
         self.handle_weapon_pickup(obs, los_enemies, &mut act);
 
+        let rear_attacker_id = self.belief.recent_rear_attacker(obs.t);
         let visible_target = select_target(
             obs,
             &self.cfg,
             &self.world,
             self.belief.mode,
             self.last_target_id,
+            rear_attacker_id,
         );
         self.last_target_id = visible_target.as_ref().filter(|t| t.is_mech).map(|t| t.id);
 
@@ -96,6 +98,7 @@ impl BotBrain {
             && (obs.t - self.belief.last_combat_t) >= 1.2;
 
         let fallback_bearing = self.belief.best_unseen_bearing(obs.me.pos, obs.t);
+        let rear_snap_bearing = self.belief.unseen_rear_snap_bearing(obs);
         let mut peek_point = None;
         decide_combat(
             obs,
@@ -107,6 +110,7 @@ impl BotBrain {
             urgent_dodge,
             combat_target.as_ref(),
             fallback_bearing,
+            rear_snap_bearing,
             self.last_aim,
             &mut self.laser_last_los_t,
             &mut peek_point,

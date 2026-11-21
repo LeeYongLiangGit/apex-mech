@@ -355,6 +355,7 @@ pub fn select_target(
     world: &World,
     mode: MatchMode,
     prev_target_id: Option<u64>,
+    rear_attacker_id: Option<u32>,
 ) -> Option<TargetInfo> {
     let muzzle = [
         obs.me.pos[0],
@@ -423,6 +424,9 @@ pub fn select_target(
         if prev_target_id == Some(m.id as u64) && los {
             score += 140.0;
         }
+        if is_mech && los && rear_attacker_id == Some(m.id) {
+            score += 360.0;
+        }
         if has_lightning && d <= 44.0 && los {
             score += 240.0;
         }
@@ -473,6 +477,7 @@ pub fn select_target(
             && (m.dist <= 55.0
                 || m.enemy_charging
                 || m.hp <= 450.0
+                || rear_attacker_id.map_or(false, |rid| m.id == rid as u64)
                 || (my_hp_frac < 0.60 && m.dist <= 110.0))
     });
     let npc_one_shot = best_npc
@@ -582,6 +587,7 @@ pub fn decide_combat(
     urgent_dodge: bool,
     target: Option<&TargetInfo>,
     fallback_bearing: Option<f64>,
+    rear_snap_bearing: Option<f64>,
     last_aim: [f64; 2],
     laser_last_los_t: &mut f64,
     peek_point: &mut Option<[f64; 3]>,
@@ -635,6 +641,19 @@ pub fn decide_combat(
         *laser_last_los_t = obs.t;
     }
     let laser_in_grace = laser_charging && t.is_mech && (obs.t - *laser_last_los_t) <= 0.35;
+
+    if let Some(rb) = rear_snap_bearing {
+        if !laser_charging && angle_diff(obs.me.aim[0], rb).abs() > 0.45 {
+            let keep_front_target = t.is_mech
+                && t.los
+                && (t.hp <= 450.0 || t.dist <= 85.0 || t.enemy_charging);
+            if !keep_front_target {
+                act.aim = [rb, -0.02];
+                maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
+                return;
+            }
+        }
+    }
 
     if ceasefire_for_regen && (!t.los || !t.is_mech) && !laser_in_grace {
         maybe_cover_reload(obs, los_enemies, Some(t), true, false, act);
