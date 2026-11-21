@@ -19,10 +19,12 @@ struct BotBrain {
     nav: NavEngine,
     mode: MatchMode,
     last_combat_t: f64,
-    last_dmg_bearing: Option<(f64, f64)>, // (bearing, timestamp)
+    last_dmg_bearing: Option<(f64, f64)>,
     prev_alive: u32,
     our_kills: u32,
     last_aim: [f64; 2],
+    strafe_sign: f64,
+    last_strafe_flip: u64,
     climb_stuck_ticks: u32,
 }
 
@@ -39,6 +41,8 @@ impl BotBrain {
             prev_alive: 16,
             our_kills: 0,
             last_aim: [0.0, 0.0],
+            strafe_sign: 1.0,
+            last_strafe_flip: 0,
             climb_stuck_ticks: 0,
         }
     }
@@ -47,35 +51,39 @@ impl BotBrain {
         self.update_state(obs);
         let mut act = Action::idle(obs.tick, obs.me.aim);
 
-        // 1. Instant upgrade resolution using live hello.config.upgrades
+        // 1. Instant upgrade pick
         if let Some(offer) = &obs.offer {
             act.pick = Some(self.pick_upgrade(offer, obs));
         }
 
-        // 2. Optimal 2-slot weapon pickup / swap
+        // 2. Optimal 2-slot weapon pickup & swap (protects sustained + burst synergy)
         self.handle_weapon_pickup(obs, &mut act);
 
-        // 3. Dodge field (bullets, parabolic mortar shells, enemy charging lasers)
+        // 3. Active dodge field (bullets, mortar parabolas, charging lasers)
         let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
 
-        // 4. Select best threat/farm target
+        // 4. Select best target & count active LOS attackers
+        let los_enemies = count_los_enemy_mechs(obs, &self.world);
         let target = select_target(obs, &self.cfg, &self.world, self.mode);
 
-        // 5. 5-second out-of-combat regen discipline
+        // 5. True regen discipline:
+        //    - seek_heal: pull behind cover when wounded
+        //    - ceasefire_for_regen: ONLY hold fire once 0 enemy mechs actually have LOS!
         let hp_frac = obs.me.hp / obs.me.max_hp.max(1.0);
-        let close_threat = obs.mechs.iter().any(|m| {
-            m.kind == "mech" && dist_2d(obs.me.pos, m.pos) < 42.0
-        });
-        let regen_mode = hp_frac < 0.72 && obs.me.in_zone && !close_threat;
+        let seek_heal = hp_frac < 0.55 && obs.me.in_zone;
+        let ceasefire_for_regen = hp_frac < 0.78
+            && obs.me.in_zone
+            && los_enemies == 0
+            && (obs.t - self.last_combat_t) >= 1.2;
 
-        // 6. Combat micro (all 4 weapons + rear armor guard)
+        // 6. Combat micro (single-weapon arbitration + rear-armor guard)
         let fallback_bearing = self.best_unseen_threat_bearing(obs);
         decide_combat(
             obs,
             &self.cfg,
             &self.world,
             self.mode,
-            regen_mode,
+            ceasefire_for_regen,
             urgent_dodge,
             target.as_ref(),
             fallback_bearing,
@@ -83,8 +91,16 @@ impl BotBrain {
             &mut act,
         );
 
-        // 7. Movement: 2.5D A* macro navigation + hard-cover corner kiting + jet-climb
-        self.decide_movement(obs, target.as_ref(), regen_mode, dodge, urgent_dodge, &mut act);
+        // 7. Continuous 16-heading strafe + corner-isolation + 2.5D A* movement
+        self.decide_movement(
+            obs,
+            target.as_ref(),
+            los_enemies,
+            seek_heal,
+            dodge,
+            urgent_dodge,
+            &mut act,
+        );
 
         act.sanitize(self.cfg.min_pitch, self.cfg.max_pitch);
         self.last_aim = act.aim;
@@ -110,20 +126,29 @@ impl BotBrain {
             }
         }
 
+        // Strict Practice vs FFA detection (no false triggers from missed laser beams)
         if self.mode == MatchMode::Unknown {
             let other_deaths = self
                 .prev_alive
                 .saturating_sub(obs.alive)
                 .saturating_sub(kills_this_tick);
-            let mech_vs_mech_beam = obs.beams.iter().any(|b| {
+
+            let verified_mech_vs_mech_beam = obs.beams.iter().any(|b| {
                 b.by != obs.me.id
-                    && b.path
-                        .last()
-                        .map_or(false, |end| dist_3d(*end, obs.me.pos) > 18.0)
+                    && b.path.last().map_or(false, |end| {
+                        obs.mechs.iter().any(|m| {
+                            m.kind == "mech"
+                                && m.id != b.by
+                                && dist_2d(*end, m.pos) < 5.0
+                        })
+                    })
             });
-            if (other_deaths > 0 && obs.zone.dps <= 35.0) || mech_vs_mech_beam {
+
+            if (other_deaths > 0 && obs.zone.dps <= 35.0 && obs.t < 160.0)
+                || verified_mech_vs_mech_beam
+            {
                 self.mode = MatchMode::FfaSurvival;
-            } else if obs.t > 40.0 && obs.alive + self.our_kills == 16 {
+            } else if obs.t > 35.0 && obs.alive + self.our_kills == 16 {
                 self.mode = MatchMode::PracticeHivemind;
             }
         }
@@ -136,7 +161,6 @@ impl BotBrain {
                 return Some(b);
             }
         }
-        // Nearest threatening audio cue (weapon fire / laser charge / boost)
         obs.sounds
             .iter()
             .filter(|s| {
@@ -160,45 +184,47 @@ impl BotBrain {
             let desc = c.desc.to_lowercase();
             let mut s = 30.0;
 
-            // Inspect live hello.config.upgrades metadata if available
             if let Some(arr) = self.cfg.raw_upgrades.as_array() {
-                if let Some(meta) = arr.iter().find(|u| u.get("id").and_then(Value::as_str) == Some(c.id.as_str())) {
-                    let meta_str = meta.to_string().to_lowercase();
-                    if meta_str.contains("armor") || meta_str.contains("damage_mult") {
+                if let Some(meta) = arr
+                    .iter()
+                    .find(|u| u.get("id").and_then(Value::as_str) == Some(c.id.as_str()))
+                {
+                    let m = meta.to_string().to_lowercase();
+                    if m.contains("armor") || m.contains("damage_mult") {
                         s += 105.0;
                     }
-                    if meta_str.contains("max_hp") || meta_str.contains("regen") {
-                        s += 95.0;
+                    if m.contains("max_hp") || m.contains("regen") {
+                        s += 98.0;
                     }
-                    if meta_str.contains("walk_speed") || meta_str.contains("boost") || meta_str.contains("energy") {
+                    if m.contains("walk_speed") || m.contains("energy") || m.contains("boost") {
                         s += 86.0;
                     }
                 }
             }
 
             if id.contains("armor") || desc.contains("damage taken") {
-                s += 110.0;
+                s += 115.0;
             }
             if id.contains("hp") || desc.contains("max hp") || desc.contains("regen") {
-                s += 96.0;
-            }
-            if id.contains("sensor") || desc.contains("vision") || desc.contains("proximity") {
-                s += if self.mode == MatchMode::FfaSurvival { 92.0 } else { 72.0 };
-            }
-            if id.contains("speed") || id.contains("energy") || id.contains("boost") || id.contains("jet") {
-                s += 84.0;
-            }
-            if id.contains("laser") {
-                s += if held_laser { 98.0 } else { 40.0 };
+                s += 100.0;
             }
             if id.contains("lightning") {
-                s += if held_lightning { 96.0 } else { 40.0 };
+                s += if held_lightning { 108.0 } else { 40.0 };
+            }
+            if id.contains("laser") {
+                s += if held_laser { 102.0 } else { 40.0 };
+            }
+            if id.contains("speed") || id.contains("energy") || id.contains("boost") {
+                s += 88.0;
+            }
+            if id.contains("sensor") || desc.contains("vision") || desc.contains("proximity") {
+                s += if self.mode == MatchMode::FfaSurvival { 94.0 } else { 65.0 };
             }
             if id.contains("mortar") {
-                s += if held_mortar || obs.zone.radius <= 140.0 { 88.0 } else { 35.0 };
+                s += if held_mortar { 86.0 } else { 30.0 };
             }
             if id.contains("gun") {
-                s += if !held_laser && !held_lightning { 65.0 } else { 35.0 };
+                s += if !held_laser && !held_lightning { 72.0 } else { 32.0 };
             }
             s
         };
@@ -214,21 +240,27 @@ impl BotBrain {
 
     fn weapon_priority(&self, kind: &str, obs: &ObsMsg) -> i32 {
         match kind {
-            "laser" => 100,
-            "lightning" => 96,
+            "lightning" => 100, // 240 DPS instant, AoE chain, shorts enemy lasers, fast crate clear
+            "laser" => 97,      // 315 hitscan burst + cook-off
             "mortar" => {
-                // Avoid carrying mortar early (laser +60% cook-off risk), love it in final circles
-                if obs.zone.radius <= 140.0 {
-                    99
-                } else if self.mode == MatchMode::PracticeHivemind {
-                    78
+                if self.mode == MatchMode::FfaSurvival && obs.zone.radius <= 140.0 {
+                    98
                 } else {
-                    42
+                    45 // Avoid early mortar (laser +60% cook-off vulnerability)
                 }
             }
-            "gun" => 50,
+            "gun" => 60,
             _ => 0,
         }
+    }
+
+    /// Prevents creating the slow `laser + mortar` trap (always keep lightning or gun).
+    fn valid_loadout_pair(a: &str, b: &str) -> bool {
+        if a == b {
+            return false;
+        }
+        let has_sustained = a == "lightning" || b == "lightning" || a == "gun" || b == "gun";
+        has_sustained
     }
 
     fn handle_weapon_pickup(&self, obs: &ObsMsg, act: &mut Action) {
@@ -254,13 +286,23 @@ impl BotBrain {
                     best = Some((new_prio, p.id, None));
                 }
             } else {
-                for (slot_idx, slot) in obs.me.weapons.iter().enumerate() {
+                for (slot_idx, slot) in obs.me.weapons.iter().enumerate().take(2) {
                     let Some(w) = slot else { continue };
                     if w.kind == "laser" && w.charge > 0.0 {
                         continue;
                     }
+                    let other_kind = obs
+                        .me
+                        .weapons
+                        .get(1 - slot_idx)
+                        .and_then(|s| s.as_ref())
+                        .map(|s| s.kind.as_str())
+                        .unwrap_or("");
+                    if !other_kind.is_empty() && !Self::valid_loadout_pair(&p.kind, other_kind) {
+                        continue;
+                    }
                     let cur_prio = self.weapon_priority(&w.kind, obs);
-                    if new_prio > cur_prio + 12 && best.map_or(true, |b| new_prio > b.0) {
+                    if new_prio > cur_prio + 10 && best.map_or(true, |b| new_prio > b.0) {
                         best = Some((new_prio, p.id, Some(slot_idx)));
                     }
                 }
@@ -278,108 +320,7 @@ impl BotBrain {
         d <= (obs.zone.next_radius - margin).max(4.0)
     }
 
-    /// Evaluates 24 local tactical spots around the mech to find 1-on-1 peek corners
-    /// or full hard-cover breaks against the 1v15 squad / FFA threats.
-    fn pick_tactical_cover_spot(
-        &self,
-        obs: &ObsMsg,
-        regen_mode: bool,
-        primary: &TargetInfo,
-    ) -> Option<[f64; 3]> {
-        let pos = obs.me.pos;
-        let radius = obs.me.radius();
-        let height = obs.me.height();
-        let my_eye_off = obs.me.eye_height();
-
-        let enemy_mechs: Vec<&VisibleMech> = obs
-            .mechs
-            .iter()
-            .filter(|m| m.kind == "mech" && dist_2d(pos, m.pos) < 160.0)
-            .collect();
-        if enemy_mechs.is_empty() {
-            return None;
-        }
-
-        let mut best_spot: Option<(f64, [f64; 3])> = None;
-        for &r in &[10.0, 20.0] {
-            for k in 0..12 {
-                let ang = (k as f64) * (2.0 * PI / 12.0);
-                let cx = pos[0] + ang.cos() * r;
-                let cy = pos[1] + ang.sin() * r;
-                if !self
-                    .world
-                    .is_walkable_step(pos, cx, cy, radius, height, self.cfg.step_up)
-                {
-                    continue;
-                }
-                // Check zone safety
-                let dist_cur_z = ((cx - obs.zone.center[0]).powi(2) + (cy - obs.zone.center[1]).powi(2)).sqrt();
-                if dist_cur_z > obs.zone.radius - 6.0 {
-                    continue;
-                }
-
-                let cz = self.world.terrain_height(cx, cy).max(pos[2] - 2.0);
-                let cand_eye = [cx, cy, cz + my_eye_off];
-
-                let mut los_count = 0_usize;
-                let mut sees_primary = false;
-                let mut min_enemy_d = f64::INFINITY;
-
-                for em in &enemy_mechs {
-                    let eh = 9.0 * (1.0 + 0.05 * em.cubes as f64);
-                    let e_eye = [em.pos[0], em.pos[1], em.pos[2] + eh * 0.85];
-                    let d = dist_2d([cx, cy, cz], em.pos);
-                    min_enemy_d = min_enemy_d.min(d);
-                    if self.world.raycast_solid(e_eye, cand_eye).is_none() {
-                        los_count += 1;
-                        if em.id as u64 == primary.id {
-                            sees_primary = true;
-                        }
-                    }
-                }
-
-                let mut score = 0.0;
-                if regen_mode {
-                    // Break ALL sightlines so 5-second regen finishes untouched
-                    score += if los_count == 0 { 160.0 } else { -(los_count as f64) * 90.0 };
-                    score += min_enemy_d.min(90.0) * 1.2;
-                } else {
-                    // Isolate 1-on-1 duels! Huge advantage against 1v15 hivemind and FFA third-parties
-                    if los_count == 1 && sees_primary {
-                        score += 140.0;
-                    } else if los_count == 0 {
-                        score += 75.0; // Safe peek/reload spot
-                    } else {
-                        score -= (los_count as f64 - 1.0) * 110.0;
-                    }
-                    let ideal_d = if obs.me.weapons.iter().any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"))
-                        && enemy_mechs.len() == 1
-                        && !primary.has_mortar
-                    {
-                        32.0
-                    } else {
-                        58.0
-                    };
-                    score -= (dist_2d([cx, cy, cz], primary.pos) - ideal_d).abs() * 1.1;
-                }
-
-                if self.nav.is_near_cover(cx, cy) {
-                    score += 22.0;
-                }
-                if self.is_in_safe_next_zone(cx, cy, obs, 12.0) {
-                    score += 30.0;
-                }
-                score += (cz - pos[2]).clamp(-4.0, 8.0) * 3.0;
-
-                if best_spot.map_or(true, |(bs, _)| score > bs) {
-                    best_spot = Some((score, [cx, cy, cz]));
-                }
-            }
-        }
-        best_spot.map(|(_, p)| p)
-    }
-
-    fn choose_macro_goal(&self, obs: &ObsMsg, target: Option<&TargetInfo>, regen_mode: bool) -> [f64; 3] {
+    fn choose_macro_goal(&self, obs: &ObsMsg, target: Option<&TargetInfo>) -> [f64; 3] {
         let pos = obs.me.pos;
         let next_z = [
             obs.zone.next_center[0],
@@ -388,29 +329,20 @@ impl BotBrain {
                 .terrain_height(obs.zone.next_center[0], obs.zone.next_center[1]),
         ];
 
-        // 1. Zone survival priority
+        // 1. Zone rotation safety
         let dist_next = dist_2d(pos, next_z);
         let time_to_shrink = (obs.zone.shrink_start - obs.t).max(0.0);
         let must_rotate = !obs.me.in_zone
-            || (dist_next > (obs.zone.next_radius - 18.0).max(5.0)
-                && (time_to_shrink < 18.0 || obs.zone.dps >= 60.0));
+            || (dist_next > (obs.zone.next_radius - 16.0).max(5.0)
+                && (time_to_shrink < 16.0 || obs.zone.dps >= 60.0));
         if must_rotate {
             return next_z;
         }
 
-        // 2. Tactical cover / 1v1 corner kiting when engaged by enemy mechs
-        if let Some(t) = target {
-            if t.is_mech && (t.dist < 95.0 || regen_mode) {
-                if let Some(cover_spot) = self.pick_tactical_cover_spot(obs, regen_mode, t) {
-                    return cover_spot;
-                }
-            }
-        }
-
-        // 3. Weapon pickup priority (especially BEFORE grabbing a cube that hits an upgrade threshold)
+        // 2. High-value weapon pickup (especially lightning / laser, or before upgrade threshold)
         let next_hits_upgrade = UPGRADE_THRESHOLDS.contains(&(obs.me.cubes + 1));
         let empty_slot = obs.me.weapons.iter().any(|w| w.is_none());
-        let best_weapon_pickup = obs
+        let best_pickup = obs
             .pickups
             .iter()
             .filter(|p| {
@@ -419,12 +351,12 @@ impl BotBrain {
                     .weapons
                     .iter()
                     .any(|w| w.as_ref().map_or(false, |s| s.kind == p.kind));
-                if already_have || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 8.0) {
+                if already_have || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 6.0) {
                     return false;
                 }
                 let prio = self.weapon_priority(&p.kind, obs);
                 if empty_slot {
-                    prio >= 75
+                    prio >= 90
                 } else {
                     let min_held = obs
                         .me
@@ -439,41 +371,42 @@ impl BotBrain {
             })
             .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)));
 
-        if let Some(p) = best_weapon_pickup {
-            let max_range = if empty_slot || next_hits_upgrade { 95.0 } else { 55.0 };
-            if dist_2d(pos, p.pos) < max_range {
+        if let Some(p) = best_pickup {
+            let max_r = if empty_slot || next_hits_upgrade { 95.0 } else { 55.0 };
+            if dist_2d(pos, p.pos) < max_r {
                 return p.pos;
             }
         }
 
-        // 4. Supply drops (3 cubes + full HP + full energy)
-        let visible_mechs = obs.mechs.iter().filter(|m| m.kind == "mech").count();
+        // 3. Supply drops (3 cubes + FULL HP + FULL ENERGY!)
+        let near_mechs = obs
+            .mechs
+            .iter()
+            .filter(|m| m.kind == "mech" && dist_2d(pos, m.pos) < 50.0)
+            .count();
         for d in &obs.drops {
             let dist = dist_2d(pos, d.pos);
-            if d.lands_in <= 14.0 && dist < 130.0 {
-                let safe_to_cap = self.mode == MatchMode::PracticeHivemind || visible_mechs == 0;
-                if safe_to_cap {
+            if d.lands_in <= 14.0 && dist < 140.0 {
+                if self.mode != MatchMode::FfaSurvival || near_mechs == 0 {
                     return d.pos;
-                } else if self.mode == MatchMode::FfaSurvival && dist > 45.0 {
-                    // Hold overwatch ~40m off the drop to ambush capturers
+                } else if dist > 45.0 {
                     let ux = (pos[0] - d.pos[0]) / dist.max(1.0);
                     let uy = (pos[1] - d.pos[1]) / dist.max(1.0);
-                    return [d.pos[0] + ux * 40.0, d.pos[1] + uy * 40.0, d.pos[2]];
+                    return [d.pos[0] + ux * 42.0, d.pos[1] + uy * 42.0, d.pos[2]];
                 }
             }
         }
 
-        // 5. Fast 10-cube rush: loose cubes, nearby crates, and isolated NPCs
-        let want_cubes = obs.me.cubes < self.cfg.cube_stat_cap
-            || (obs.me.cubes == 14 && obs.me.hp / obs.me.max_hp.max(1.0) > 0.7);
+        // 4. Fast 10-cube snowball: loose cubes > nearby crates > isolated NPCs
+        let want_cubes = obs.me.cubes < self.cfg.cube_stat_cap || obs.me.cubes == 14;
         if want_cubes {
             if let Some(c) = obs
                 .cubes
                 .iter()
-                .filter(|c| self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 6.0))
+                .filter(|c| self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 5.0))
                 .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
             {
-                if dist_2d(pos, c.pos) < 80.0 {
+                if dist_2d(pos, c.pos) < 85.0 {
                     return c.pos;
                 }
             }
@@ -483,7 +416,7 @@ impl BotBrain {
                 .filter(|c| self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 8.0))
                 .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
             {
-                if dist_2d(pos, cr.pos) < 70.0 {
+                if dist_2d(pos, cr.pos) < 75.0 {
                     return cr.pos;
                 }
             }
@@ -501,14 +434,31 @@ impl BotBrain {
             }
         }
 
-        // 6. Claim high-ground rooftop inside next safe zone
-        if let Some(roof) = self.nav.find_safe_rooftop(
-            pos,
-            obs.zone.next_center,
-            obs.zone.next_radius,
-            110.0,
-        ) {
-            return roof;
+        // 5. Mode-specific mid/late objective:
+        //    - Practice: actively hunt tracked mechs when healthy to snowball placement
+        //    - FFA: claim safe rooftop high ground inside next circle
+        if self.mode == MatchMode::PracticeHivemind && obs.me.hp / obs.me.max_hp.max(1.0) > 0.65 {
+            if let Some(t) = target {
+                if t.is_mech {
+                    return t.pos;
+                }
+            }
+            if let Some(s) = obs.sounds.iter().min_by(|a, b| a.age.total_cmp(&b.age)) {
+                return [
+                    pos[0] + s.bearing.cos() * 65.0,
+                    pos[1] + s.bearing.sin() * 65.0,
+                    pos[2],
+                ];
+            }
+        } else if self.mode == MatchMode::FfaSurvival && near_mechs == 0 {
+            if let Some(roof) = self.nav.find_safe_rooftop(
+                pos,
+                obs.zone.next_center,
+                obs.zone.next_radius,
+                100.0,
+            ) {
+                return roof;
+            }
         }
 
         next_z
@@ -518,7 +468,8 @@ impl BotBrain {
         &mut self,
         obs: &ObsMsg,
         target: Option<&TargetInfo>,
-        regen_mode: bool,
+        los_enemies: usize,
+        seek_heal: bool,
         dodge: [f64; 2],
         urgent_dodge: bool,
         act: &mut Action,
@@ -526,94 +477,242 @@ impl BotBrain {
         let pos = obs.me.pos;
         let radius = obs.me.radius();
         let height = obs.me.height();
+        let my_eye_off = obs.me.eye_height();
 
-        let goal = self.choose_macro_goal(obs, target, regen_mode);
-        let allow_jet = obs.me.energy >= 45.0 && !urgent_dodge;
-        let wp = self.nav.next_waypoint(obs.tick, pos, goal, allow_jet);
+        let has_lightning = obs
+            .me
+            .weapons
+            .iter()
+            .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
+        let has_laser = obs
+            .me
+            .weapons
+            .iter()
+            .any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
 
-        // Jet-climb controller when next waypoint is on a higher rooftop
-        let climbing = wp.z > pos[2] + self.cfg.step_up + 0.3 && obs.me.energy > 12.0 && !urgent_dodge;
-        let mut desired = [wp.x - pos[0], wp.y - pos[1]];
-
-        if climbing {
-            let dh = (desired[0] * desired[0] + desired[1] * desired[1]).sqrt();
-            if dh < 9.0 {
-                if obs.me.grounded {
-                    act.jump = true;
-                }
-                act.boost = true;
-                // Detect eave snag while jetting upward; nudge back briefly to clear eave
-                if !obs.me.grounded && obs.me.vel[2] < 1.2 {
-                    self.climb_stuck_ticks += 1;
-                } else {
-                    self.climb_stuck_ticks = 0;
-                }
-                if self.climb_stuck_ticks >= 2 && self.climb_stuck_ticks <= 5 {
-                    desired = [-desired[0], -desired[1]];
-                } else if pos[2] < wp.z + 0.25 {
-                    // Rise cleanly before pushing horizontally onto the roof edge
-                    desired = [desired[0] * 0.35, desired[1] * 0.35];
-                }
-            }
-        } else {
-            self.climb_stuck_ticks = 0;
+        // Flip strafe direction periodically so bots can't predict constant orbits
+        if obs.tick.saturating_sub(self.last_strafe_flip) >= 18 {
+            self.strafe_sign = -self.strafe_sign;
+            self.last_strafe_flip = obs.tick;
         }
 
-        // Blend A* direction with active dodge vector
-        let d_len = (desired[0] * desired[0] + desired[1] * desired[1]).sqrt();
-        let nav_u = if d_len > 0.5 {
-            [desired[0] / d_len, desired[1] / d_len]
+        let goal = self.choose_macro_goal(obs, target);
+        // Only allow rooftop jet-climbing when unengaged and high energy
+        let allow_jet = self.mode == MatchMode::FfaSurvival
+            && los_enemies == 0
+            && obs.me.energy >= 65.0
+            && !urgent_dodge;
+        let wp = self.nav.next_waypoint(obs.tick, pos, goal, allow_jet);
+
+        // Rooftop jet-climb (only when safe & high energy)
+        let climbing = allow_jet
+            && wp.z > pos[2] + self.cfg.step_up + 0.4
+            && ((wp.x - pos[0]).powi(2) + (wp.y - pos[1]).powi(2)).sqrt() < 9.0;
+        if climbing {
+            if obs.me.grounded {
+                act.jump = true;
+            }
+            act.boost = true;
+            if !obs.me.grounded && obs.me.vel[2] < 1.2 {
+                self.climb_stuck_ticks += 1;
+            } else {
+                self.climb_stuck_ticks = 0;
+            }
+            let mut dx = wp.x - pos[0];
+            let mut dy = wp.y - pos[1];
+            if self.climb_stuck_ticks >= 2 && self.climb_stuck_ticks <= 5 {
+                dx = -dx;
+                dy = -dy;
+            } else if pos[2] < wp.z + 0.25 {
+                dx *= 0.35;
+                dy *= 0.35;
+            }
+            let l = (dx * dx + dy * dy).sqrt().max(1e-4);
+            act.move_dir = [dx / l, dy / l];
+            return;
+        }
+        self.climb_stuck_ticks = 0;
+
+        // Nav unit vector
+        let nav_dx = wp.x - pos[0];
+        let nav_dy = wp.y - pos[1];
+        let nav_len = (nav_dx * nav_dx + nav_dy * nav_dy).sqrt();
+        let nav_u = if nav_len > 0.5 {
+            [nav_dx / nav_len, nav_dy / nav_len]
         } else {
             [0.0, 0.0]
         };
 
-        let combined = if urgent_dodge {
-            [dodge[0] * 1.5 + nav_u[0] * 0.4, dodge[1] * 1.5 + nav_u[1] * 0.4]
+        let dodge_len = (dodge[0] * dodge[0] + dodge[1] * dodge[1]).sqrt();
+        let dodge_u = if dodge_len > 0.05 {
+            [dodge[0] / dodge_len, dodge[1] / dodge_len]
         } else {
-            [nav_u[0] + dodge[0], nav_u[1] + dodge[1]]
+            [0.0, 0.0]
         };
-        let c_len = (combined[0] * combined[0] + combined[1] * combined[1]).sqrt();
-        if c_len < 1e-4 {
-            return;
-        }
 
-        let base_yaw = combined[1].atan2(combined[0]);
-        // Local collision smoothing around corners (skip during vertical roof climb)
-        let best_yaw = if climbing {
-            base_yaw
+        // Gather nearby enemy mechs for real-time 16-heading tactical scoring
+        let enemy_mechs: Vec<&VisibleMech> = obs
+            .mechs
+            .iter()
+            .filter(|m| m.kind == "mech" && dist_2d(pos, m.pos) < 150.0)
+            .collect();
+        let in_combat = !enemy_mechs.is_empty();
+
+        // Ideal combat spacing based on our loadout vs primary threat
+        let primary_mech = target.filter(|t| t.is_mech);
+        let ideal_dist = if let Some(pm) = primary_mech {
+            if seek_heal || los_enemies >= 2 {
+                90.0 // Pull back around corners when outnumbered or wounded
+            } else if has_lightning && obs.me.energy >= 20.0 && !pm.has_mortar {
+                29.0 // Melt inside 45m lightning range while circle-strafing
+            } else if pm.has_lightning && !has_lightning {
+                68.0 // Kite outside enemy lightning range
+            } else if has_laser {
+                72.0
+            } else {
+                54.0
+            }
         } else {
-            let mut byaw = base_yaw;
-            let mut bscore = f64::NEG_INFINITY;
-            for step in -5..=5 {
-                let yaw = base_yaw + (step as f64) * (PI / 12.0);
-                let ux = yaw.cos();
-                let uy = yaw.sin();
-                let ok1 = self
-                    .world
-                    .is_walkable_step(pos, pos[0] + ux * 3.0, pos[1] + uy * 3.0, radius, height, self.cfg.step_up);
-                let ok2 = ok1
-                    && self.world.is_walkable_step(
-                        pos,
-                        pos[0] + ux * 6.5,
-                        pos[1] + uy * 6.5,
-                        radius,
-                        height,
-                        self.cfg.step_up,
-                    );
-                let align = (yaw - base_yaw).cos();
-                let score = align * 10.0 + if ok2 { 18.0 } else if ok1 { 6.0 } else { -40.0 };
-                if score > bscore {
-                    bscore = score;
-                    byaw = yaw;
+            55.0
+        };
+
+        // Evaluate 16 continuous headings: NEVER stop moving in combat!
+        let mut best_yaw = nav_dy.atan2(nav_dx);
+        let mut best_score = f64::NEG_INFINITY;
+
+        for k in 0..16 {
+            let yaw = (k as f64) * (2.0 * PI / 16.0);
+            let ux = yaw.cos();
+            let uy = yaw.sin();
+
+            // Exact cylinder wall check at 3.2 m and 7.0 m
+            let ok_near = self.world.is_walkable_step(
+                pos,
+                pos[0] + ux * 3.2,
+                pos[1] + uy * 3.2,
+                radius + 0.2,
+                height,
+                self.cfg.step_up,
+            );
+            let ok_far = ok_near
+                && self.world.is_walkable_step(
+                    pos,
+                    pos[0] + ux * 7.0,
+                    pos[1] + uy * 7.0,
+                    radius + 0.2,
+                    height,
+                    self.cfg.step_up,
+                );
+
+            let mut score = if ok_far {
+                35.0
+            } else if ok_near {
+                8.0
+            } else {
+                -180.0
+            };
+
+            // Zone safety at 10m lookahead
+            let lx = pos[0] + ux * 10.0;
+            let ly = pos[1] + uy * 10.0;
+            let d_cur_z = ((lx - obs.zone.center[0]).powi(2) + (ly - obs.zone.center[1]).powi(2)).sqrt();
+            if d_cur_z > obs.zone.radius - 4.0 {
+                score -= 220.0;
+            } else if !obs.me.in_zone {
+                let d_next_z = ((lx - obs.zone.next_center[0]).powi(2) + (ly - obs.zone.next_center[1]).powi(2)).sqrt();
+                score -= d_next_z * 2.5;
+            }
+
+            // Active projectile / laser dodge alignment (top priority)
+            if dodge_len > 0.05 {
+                let dodge_dot = ux * dodge_u[0] + uy * dodge_u[1];
+                score += dodge_dot * if urgent_dodge { 150.0 } else { 75.0 };
+            }
+
+            // Macro A* alignment
+            let nav_dot = ux * nav_u[0] + uy * nav_u[1];
+            let nav_weight = if !obs.me.in_zone {
+                95.0
+            } else if in_combat {
+                22.0
+            } else {
+                65.0
+            };
+            score += nav_dot * nav_weight;
+
+            // Real-time combat shaping: continuous circle-strafing + 1v1 corner isolation
+            if in_combat && ok_near {
+                let cand_eye = [lx, ly, pos[2] + my_eye_off];
+                let mut future_los = 0_usize;
+                for em in &enemy_mechs {
+                    let eh = 9.0 * (1.0 + 0.05 * em.cubes as f64);
+                    let e_eye = [em.pos[0], em.pos[1], em.pos[2] + 0.78 * eh];
+                    if self.world.raycast_solid(e_eye, cand_eye).is_none() {
+                        future_los += 1;
+                    }
+                }
+
+                if seek_heal || los_enemies >= 2 {
+                    // Break extra sightlines around building corners!
+                    if future_los == 0 {
+                        score += if seek_heal { 125.0 } else { 70.0 };
+                    } else if future_los == 1 && !seek_heal {
+                        score += 105.0; // Isolate 1v1 duel!
+                    } else {
+                        score -= (future_los as f64) * 65.0;
+                    }
+                    if self.nav.is_near_cover(lx, ly) {
+                        score += 18.0;
+                    }
+                } else if let Some(pm) = primary_mech {
+                    // Clean 1v1: maintain optimal spacing + strong continuous lateral strafe
+                    let to_x = pm.pos[0] - pos[0];
+                    let to_y = pm.pos[1] - pos[1];
+                    let d = (to_x * to_x + to_y * to_y).sqrt().max(1.0);
+                    let rx = to_x / d;
+                    let ry = to_y / d;
+                    // Perpendicular strafe vector
+                    let sx = -ry * self.strafe_sign;
+                    let sy = rx * self.strafe_sign;
+
+                    let strafe_dot = ux * sx + uy * sy;
+                    score += strafe_dot * 42.0;
+
+                    let new_d = ((pm.pos[0] - lx).powi(2) + (pm.pos[1] - ly).powi(2)).sqrt();
+                    let cur_err = (d - ideal_dist).abs();
+                    let new_err = (new_d - ideal_dist).abs();
+                    score += (cur_err - new_err) * 4.5;
+
+                    // Keep LOS in a favorable 1v1 unless reloading/healing
+                    if future_los == 1 {
+                        score += 18.0;
+                    }
                 }
             }
-            byaw
-        };
 
-        // Silent-walk stealth in late FFA when unengaged and safely inside next zone
-        let mut mag = if d_len < 2.0 && !urgent_dodge { 0.35 } else { 1.0 };
+            if score > best_score {
+                best_score = score;
+                best_yaw = yaw;
+            }
+        }
+
+        // Flip strafe direction immediately if our chosen path is close to a wall
+        if !self.world.is_walkable_step(
+            pos,
+            pos[0] + best_yaw.cos() * 4.5,
+            pos[1] + best_yaw.sin() * 4.5,
+            radius + 0.2,
+            height,
+            self.cfg.step_up,
+        ) {
+            self.strafe_sign = -self.strafe_sign;
+            self.last_strafe_flip = obs.tick;
+        }
+
+        // Silent-walk ONLY in late FFA when unengaged and safely inside next zone
+        let mut mag = 1.0;
         if self.mode == MatchMode::FfaSurvival
-            && target.is_none()
+            && !in_combat
             && !urgent_dodge
             && self.is_in_safe_next_zone(pos[0], pos[1], obs, 15.0)
             && obs.zone.radius <= 160.0
@@ -622,10 +721,14 @@ impl BotBrain {
         }
 
         act.move_dir = [best_yaw.cos() * mag, best_yaw.sin() * mag];
-        if !climbing {
-            let need_sprint = urgent_dodge || !obs.me.in_zone || (regen_mode && target.is_some());
-            act.boost = need_sprint && obs.me.grounded && obs.me.energy > 22.0;
-        }
+
+        // Smart energy hysteresis: preserve >= 35 energy if holding lightning!
+        let min_boost_energy = if has_lightning { 38.0 } else { 20.0 };
+        let need_sprint = urgent_dodge
+            || !obs.me.in_zone
+            || (seek_heal && los_enemies > 0)
+            || (los_enemies >= 2 && has_lightning && obs.me.energy > 55.0);
+        act.boost = need_sprint && obs.me.grounded && obs.me.energy >= min_boost_energy;
     }
 }
 

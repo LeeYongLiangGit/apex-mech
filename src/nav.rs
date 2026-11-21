@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 const NAV_STEP: f64 = 4.0;
-const MAX_CLIMB_M: f64 = 52.0; // 100 energy climbs ~60m; skip 70m towers
+const MAX_CLIMB_M: f64 = 46.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Waypoint {
@@ -16,7 +16,7 @@ pub struct Waypoint {
 #[derive(Clone, Copy)]
 struct NavCell {
     ground_z: f32,
-    roof_z: f32, // NEG_INFINITY if no walkable roof
+    roof_z: f32,
     blocked_ground: bool,
     near_cover: bool,
 }
@@ -55,12 +55,10 @@ pub struct NavEngine {
     ny: usize,
     step_up: f32,
     cells: Vec<NavCell>,
-    // Reusable A* scratch buffers (zero heap churn per tick)
     g_score: Vec<f32>,
     parent: Vec<u32>,
     stamp: Vec<u32>,
     cur_stamp: u32,
-    // Cached path state
     cached_goal: [f64; 3],
     cached_path: Vec<Waypoint>,
     last_plan_tick: u64,
@@ -84,7 +82,6 @@ impl NavEngine {
         ];
         let mut max_prism_top = vec![f32::NEG_INFINITY; total];
 
-        // 1. Sample terrain height
         for gy in 0..ny {
             let cy = world.min_y + (gy as f64 + 0.5) * NAV_STEP;
             for gx in 0..nx {
@@ -93,7 +90,6 @@ impl NavEngine {
             }
         }
 
-        // 2. Mark steep terrain slopes as non-walkable on ground
         for gy in 0..ny {
             for gx in 0..nx {
                 let idx = gy * nx + gx;
@@ -113,8 +109,8 @@ impl NavEngine {
             }
         }
 
-        // 3. Stamp all solid prisms (buildings, stadium, bridges) into ground/roof layers
-        let clearance = 2.1; // Mech cylinder buffer
+        // 3.1 m clearance keeps scaled mechs out of narrow wall snags
+        let clearance = 3.1;
         for p in &world.prisms {
             let gx0 = (((p.min_x - clearance - world.min_x) / NAV_STEP).floor() as isize)
                 .clamp(0, nx as isize - 1) as usize;
@@ -145,15 +141,12 @@ impl NavEngine {
                         max_prism_top[idx] = p.top as f32;
                     }
 
-                    // Low step-up platform: raise ground height
                     if p.top <= gz + step_up && p.top > gz {
                         cells[idx].ground_z = p.top as f32;
-                    } else if p.base < gz + 10.0 {
-                        // Blocks walking underneath (not a high bridge)
+                    } else if p.base < gz + 11.5 {
                         cells[idx].blocked_ground = true;
                     }
 
-                    // Walkable rooftop / bridge deck layer
                     if center_in && p.top > gz + step_up && (p.top - gz) <= MAX_CLIMB_M {
                         if (p.top as f32) > cells[idx].roof_z {
                             cells[idx].roof_z = p.top as f32;
@@ -163,7 +156,6 @@ impl NavEngine {
             }
         }
 
-        // 4. Invalidate roof cells buried beneath taller building tiers, and tag cover edges
         for gy in 1..(ny - 1) {
             for gx in 1..(nx - 1) {
                 let idx = gy * nx + gx;
@@ -173,11 +165,10 @@ impl NavEngine {
                     cells[idx].roof_z = f32::NEG_INFINITY;
                 }
                 if !cells[idx].blocked_ground {
-                    let adj_wall = cells[idx - 1].blocked_ground
+                    cells[idx].near_cover = cells[idx - 1].blocked_ground
                         || cells[idx + 1].blocked_ground
                         || cells[idx - nx].blocked_ground
                         || cells[idx + nx].blocked_ground;
-                    cells[idx].near_cover = adj_wall;
                 }
             }
         }
@@ -235,22 +226,12 @@ impl NavEngine {
 
     fn is_valid_state(&self, gx: usize, gy: usize, layer: usize) -> bool {
         let c = self.cells[gy * self.nx + gx];
-        if layer == 0 {
-            !c.blocked_ground
-        } else {
-            c.roof_z.is_finite()
-        }
+        if layer == 0 { !c.blocked_ground } else { c.roof_z.is_finite() }
     }
 
     pub fn is_near_cover(&self, x: f64, y: f64) -> bool {
         let (gx, gy) = self.world_to_grid(x, y);
         self.cells[gy * self.nx + gx].near_cover
-    }
-
-    pub fn roof_height_at(&self, x: f64, y: f64) -> Option<f64> {
-        let (gx, gy) = self.world_to_grid(x, y);
-        let rz = self.cells[gy * self.nx + gx].roof_z;
-        if rz.is_finite() { Some(rz as f64) } else { None }
     }
 
     fn snap_valid(&self, gx: usize, gy: usize, z: f64) -> (usize, usize, usize) {
@@ -261,7 +242,6 @@ impl NavEngine {
         if !c.blocked_ground && (z as f32 - c.ground_z).abs() < 4.5 {
             return (gx, gy, 0);
         }
-        // Search small ring for nearest valid node matching elevation
         let mut best = (gx, gy, 0);
         let mut best_cost = f32::INFINITY;
         for r in 1..=3_isize {
@@ -293,8 +273,6 @@ impl NavEngine {
         best
     }
 
-    /// Returns the next steering waypoint toward `goal`, re-planning via capped 2.5D A*
-    /// every 5 ticks (0.5 s) or whenever the goal shifts significantly.
     pub fn next_waypoint(
         &mut self,
         tick: u64,
@@ -316,12 +294,11 @@ impl NavEngine {
             self.last_plan_tick = tick;
         }
 
-        // Advance along cached waypoints
         while self.cached_path.len() > 1 {
             let wp = self.cached_path[0];
             let dh = ((wp.x - pos[0]).powi(2) + (wp.y - pos[1]).powi(2)).sqrt();
             let dz = (wp.z - pos[2]).abs();
-            if dh < 5.0 && dz < 3.0 {
+            if dh < 5.5 && dz < 3.0 {
                 self.cached_path.remove(0);
             } else {
                 break;
@@ -329,7 +306,6 @@ impl NavEngine {
         }
 
         if let Some(&wp) = self.cached_path.first() {
-            // Look one waypoint ahead if on the same layer for smoother movement
             if self.cached_path.len() >= 2 {
                 let w2 = self.cached_path[1];
                 if w2.layer == wp.layer && (w2.z - wp.z).abs() <= self.step_up as f64 {
@@ -391,7 +367,7 @@ impl NavEngine {
         let mut best_idx = start_idx;
         let mut best_h = heuristic(sx, sy);
         let mut expansions = 0_usize;
-        const MAX_EXPANSIONS: usize = 2200;
+        const MAX_EXPANSIONS: usize = 2000;
 
         const DIRS: [(isize, isize, f32); 8] = [
             (1, 0, 4.0),
@@ -440,14 +416,9 @@ impl NavEngine {
                     let dz = nz - cz;
 
                     let step_cost = if dz <= self.step_up {
-                        if cl == 1 && nl == 0 {
-                            dist + 2.0 // Drop off roof
-                        } else {
-                            dist
-                        }
+                        if cl == 1 && nl == 0 { dist + 2.0 } else { dist }
                     } else if allow_jet && nl == 1 && dz <= MAX_CLIMB_M as f32 {
-                        // Jet-climb onto a higher rooftop
-                        dist + 14.0 + dz * 1.5
+                        dist + 22.0 + dz * 1.8
                     } else {
                         continue;
                     };
@@ -468,7 +439,6 @@ impl NavEngine {
             }
         }
 
-        // Reconstruct path
         let mut rev = Vec::with_capacity(64);
         let mut cur = best_idx;
         while cur != u32::MAX as usize {
@@ -489,12 +459,11 @@ impl NavEngine {
         }
         rev.reverse();
         if rev.len() > 1 {
-            rev.remove(0); // Drop current cell
+            rev.remove(0);
         }
         rev
     }
 
-    /// Finds the best climbable rooftop cell inside the next safe zone near `pos`.
     pub fn find_safe_rooftop(
         &self,
         pos: [f64; 3],
@@ -528,14 +497,14 @@ impl NavEngine {
                     continue;
                 }
                 let climb = (c.roof_z as f64 - c.ground_z as f64).max(0.0);
-                if !(5.0..=38.0).contains(&climb) {
+                if !(5.0..=32.0).contains(&climb) {
                     continue;
                 }
                 let d_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();
                 if d_me > max_dist {
                     continue;
                 }
-                let score = climb * 1.4 - d_me * 0.6 - dist_center * 0.25;
+                let score = climb * 1.3 - d_me * 0.65 - dist_center * 0.25;
                 if best.map_or(true, |(bs, _)| score > bs) {
                     best = Some((score, [wx, wy, c.roof_z as f64]));
                 }
