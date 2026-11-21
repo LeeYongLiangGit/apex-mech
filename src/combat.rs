@@ -7,6 +7,7 @@ use std::f64::consts::PI;
 pub struct TargetInfo {
     pub id: u64,
     pub pos: [f64; 3],
+    pub feet_z: f64,
     pub vel: [f64; 3],
     pub dist: f64,
     pub hp: f64,
@@ -57,10 +58,16 @@ pub fn aim_dir(aim: [f64; 2]) -> [f64; 3] {
     [cp * aim[0].cos(), cp * aim[0].sin(), aim[1].sin()]
 }
 
-fn predict_aim_after_step(cur: [f64; 2], desired: [f64; 2], turn_rate: f64) -> [f64; 2] {
-    let max_step = turn_rate * 0.05;
-    let dy = angle_diff(cur[0], desired[0]).clamp(-max_step, max_step);
-    let dp = (desired[1] - cur[1]).clamp(-max_step, max_step);
+fn predict_aim_after_step(
+    cur: [f64; 2],
+    desired: [f64; 2],
+    turn_rate: f64,
+    pitch_rate: f64,
+) -> [f64; 2] {
+    let max_yaw = turn_rate * 0.05;
+    let max_pitch = pitch_rate * 0.05;
+    let dy = angle_diff(cur[0], desired[0]).clamp(-max_yaw, max_yaw);
+    let dp = (desired[1] - cur[1]).clamp(-max_pitch, max_pitch);
     [cur[0] + dy, cur[1] + dp]
 }
 
@@ -101,11 +108,13 @@ pub fn solve_mortar(
     target_pos: [f64; 3],
     target_vel: [f64; 3],
     speed: f64,
+    splash_radius: f64,
 ) -> Option<MortarSolution> {
     let g = cfg.mortar_gravity;
     let tube_z = obs.me.pos[2] + obs.me.height() + 0.5;
     let tube_base = [obs.me.pos[0], obs.me.pos[1], tube_z];
     let barrel_off = obs.me.radius() + 0.5;
+    let min_safe_dist = (splash_radius + 4.0).max(11.0);
 
     for high_arc in [false, true] {
         let mut pred = target_pos;
@@ -116,7 +125,7 @@ pub fn solve_mortar(
             let dx = pred[0] - tube_base[0];
             let dy = pred[1] - tube_base[1];
             let horiz = (dx * dx + dy * dy).sqrt();
-            if !(12.0..=228.0).contains(&horiz) {
+            if !(min_safe_dist..=228.0).contains(&horiz) {
                 valid_pitch = None;
                 break;
             }
@@ -145,7 +154,7 @@ pub fn solve_mortar(
                 break;
             }
             flight_t = (r / vx).clamp(0.1, 6.0);
-            let lead_t = flight_t.min(2.0);
+            let lead_t = flight_t.min(1.85);
             let cand = [
                 target_pos[0] + target_vel[0] * lead_t,
                 target_pos[1] + target_vel[1] * lead_t,
@@ -165,7 +174,7 @@ pub fn solve_mortar(
         }
 
         let Some(pitch) = valid_pitch else { continue };
-        if dist_2d(obs.me.pos, pred) < 10.0 {
+        if dist_2d(obs.me.pos, pred) < min_safe_dist {
             continue;
         }
         let yaw = (pred[1] - tube_base[1]).atan2(pred[0] - tube_base[0]);
@@ -201,6 +210,115 @@ pub fn solve_mortar(
         }
     }
     None
+}
+
+/// Checks 4.5 m and 8.0 m perpendicular corner steps for a walkable, in-zone
+/// peek spot that gives direct laser LOS to `target_pos`.
+fn find_laser_peek_point(
+    obs: &ObsMsg,
+    cfg: &RuleConfig,
+    world: &World,
+    target_pos: [f64; 3],
+) -> Option<[f64; 3]> {
+    let pos = obs.me.pos;
+    let dx = target_pos[0] - pos[0];
+    let dy = target_pos[1] - pos[1];
+    let d = (dx * dx + dy * dy).sqrt();
+    if d < 12.0 {
+        return None;
+    }
+    let px = -dy / d;
+    let py = dx / d;
+    let radius = obs.me.radius() + 0.2;
+    let height = obs.me.height();
+    let muzzle_off = obs.me.muzzle_height();
+    let on_roof = pos[2] > world.terrain_height(pos[0], pos[1]) + 2.5;
+    let safe_r = (obs.zone.radius - 5.0).max(4.0);
+
+    for &step_dist in &[4.5, 8.0] {
+        for &sign in &[1.0, -1.0] {
+            let nx = pos[0] + px * sign * step_dist;
+            let ny = pos[1] + py * sign * step_dist;
+            let dz = ((nx - obs.zone.center[0]).powi(2) + (ny - obs.zone.center[1]).powi(2)).sqrt();
+            if dz > safe_r {
+                continue;
+            }
+            if !world.is_walkable_step(
+                pos,
+                nx,
+                ny,
+                radius,
+                height,
+                cfg.step_up,
+                cfg.max_slope_deg,
+            ) {
+                continue;
+            }
+            let nz = if on_roof {
+                pos[2]
+            } else {
+                world.terrain_height(nx, ny)
+            };
+            let cand_muzzle = [nx, ny, nz + muzzle_off];
+            if world.raycast_solid(cand_muzzle, target_pos).is_none() {
+                return Some([nx, ny, nz]);
+            }
+        }
+    }
+    None
+}
+
+/// Computes optimal mortar impact point (near feet for reliable ground splash):
+/// - Averages clumped mechs within splash reach
+/// - Offsets inward near high-DPS zone edges to blast rivals outside the zone
+fn compute_mortar_aim_point(
+    obs: &ObsMsg,
+    t: &TargetInfo,
+    splash_radius: f64,
+) -> ([f64; 3], [f64; 3], bool, bool) {
+    let mut sum_x = t.pos[0];
+    let mut sum_y = t.pos[1];
+    let mut sum_z = t.feet_z + 1.0;
+    let mut sum_vx = t.vel[0];
+    let mut sum_vy = t.vel[1];
+    let mut count = 1.0;
+
+    if t.is_mech {
+        let clump_r = splash_radius * 1.45;
+        for m in &obs.mechs {
+            if m.kind != "mech" || m.id as u64 == t.id {
+                continue;
+            }
+            let d = ((m.pos[0] - t.pos[0]).powi(2) + (m.pos[1] - t.pos[1]).powi(2)).sqrt();
+            if d <= clump_r && (m.pos[2] - t.feet_z).abs() <= 5.0 {
+                sum_x += m.pos[0];
+                sum_y += m.pos[1];
+                sum_z += m.pos[2] + 1.0;
+                sum_vx += m.vel[0];
+                sum_vy += m.vel[1];
+                count += 1.0;
+            }
+        }
+    }
+
+    let clumped = count >= 2.0;
+    let mut aim_pt = [sum_x / count, sum_y / count, sum_z / count];
+    let aim_vel = [sum_vx / count, sum_vy / count, 0.0];
+    let mut zone_knock = false;
+
+    if t.is_mech && !clumped && (obs.zone.dps >= 60.0 || obs.zone.radius <= 140.0) {
+        let zx = aim_pt[0] - obs.zone.center[0];
+        let zy = aim_pt[1] - obs.zone.center[1];
+        let dz = (zx * zx + zy * zy).sqrt();
+        if dz > 5.0 && dz >= (obs.zone.radius - 22.0).max(0.0) {
+            // Land shell 2.4 m inside their position so radial knockback launches them out
+            aim_pt[0] -= (zx / dz) * 2.4;
+            aim_pt[1] -= (zy / dz) * 2.4;
+            zone_knock = true;
+        }
+    }
+
+    (aim_pt, aim_vel, clumped, zone_knock)
 }
 
 pub fn count_los_enemy_mechs(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> usize {
@@ -270,7 +388,7 @@ pub fn select_target(
         };
 
         let d = dist_3d(muzzle, aim_pt);
-        if !los && d > 165.0 {
+        if !los && d > 195.0 {
             continue;
         }
 
@@ -309,7 +427,7 @@ pub fn select_target(
             score += 220.0;
         }
         if !los {
-            score -= if has_mortar && d <= 200.0 { 160.0 } else { 520.0 };
+            score -= if has_mortar && d <= 200.0 { 130.0 } else { 520.0 };
         }
         if mode == MatchMode::FfaSurvival && is_mech && d > 85.0 && hp > 950.0 && !rear_exposed {
             score -= 360.0;
@@ -319,6 +437,7 @@ pub fn select_target(
             best = Some(TargetInfo {
                 id: m.id as u64,
                 pos: aim_pt,
+                feet_z: m.pos[2],
                 vel: m.vel,
                 dist: d,
                 hp,
@@ -349,6 +468,7 @@ pub fn select_target(
                 best = Some(TargetInfo {
                     id: c.id,
                     pos: pt,
+                    feet_z: c.pos[2],
                     vel: [0.0, 0.0, 0.0],
                     dist: d,
                     hp: c.hp,
@@ -424,14 +544,17 @@ pub fn decide_combat(
     fallback_bearing: Option<f64>,
     last_aim: [f64; 2],
     laser_last_los_t: &mut f64,
+    peek_point: &mut Option<[f64; 3]>,
     act: &mut Action,
 ) {
+    *peek_point = None;
     let muzzle = [
         obs.me.pos[0],
         obs.me.pos[1],
         obs.me.pos[2] + obs.me.muzzle_height(),
     ];
     let turn_rate = obs.me.turn_rate();
+    let pitch_rate = obs.me.stat_f64("pitch_rate", 3.0);
     let cube_mult =
         1.0 + cfg.cube_damage_per_cube * (obs.me.cubes.min(cfg.cube_stat_cap) as f64);
 
@@ -495,7 +618,7 @@ pub fn decide_combat(
         let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
         if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
             act.aim = direct_aim;
-            let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate);
+            let pred = predict_aim_after_step(obs.me.aim, act.aim, turn_rate, pitch_rate);
             if angle_diff(pred[0], direct_aim[0]).abs() <= cone {
                 act.fire[i] = true;
             }
@@ -503,7 +626,7 @@ pub fn decide_combat(
         }
     }
 
-    // 2. Laser: 0.35 s LOS-blink grace window + allow multi-enemy charge outside close/dodge
+    // 2. Laser: LOS fire + verified corner pre-charge peek-shooting (0.35 s blink grace)
     if let Some((i, w)) = laser_slot {
         let range = w.stat_f64("range", 280.0);
         let full_charge = w.stat_f64("charge", 0.75);
@@ -513,7 +636,7 @@ pub fn decide_combat(
         let hold_s = w.stat_f64("hold_s", 2.0);
 
         let multi_enemy_ok = los_enemies <= 1 || t.has_mortar || t.dist > 50.0;
-        let safe_to_charge = !t.is_crate
+        let safe_los_charge = !t.is_crate
             && t.los
             && t.dist <= range
             && (t.dist > 45.0 || !has_close_weapon)
@@ -547,6 +670,10 @@ pub fn decide_combat(
             let los_lost_s = (obs.t - *laser_last_los_t).max(0.0);
             let los_grace_expired = !t.los && los_lost_s > 0.35;
 
+            if !t.los && !los_grace_expired && t.is_mech {
+                *peek_point = find_laser_peek_point(obs, cfg, world, t.pos);
+            }
+
             if ready && t.los && aligned && barrel_clear {
                 act.fire[i] = false;
                 return;
@@ -554,7 +681,7 @@ pub fn decide_combat(
                 || (urgent_dodge && t.dist < 32.0)
                 || los_grace_expired
             {
-                act.fire[i] = false; // Drop charge to regain full speed
+                act.fire[i] = false; // Release to regain full speed
                 maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
                 return;
             } else {
@@ -562,30 +689,86 @@ pub fn decide_combat(
                 maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
                 return;
             }
-        } else if w.cooldown <= 0.0 && safe_to_charge {
+        } else if w.cooldown <= 0.0 && safe_los_charge {
             *laser_last_los_t = obs.t;
             act.aim = direct_aim;
             act.fire[i] = true;
             return;
+        } else if w.cooldown <= 0.0
+            && !t.los
+            && t.is_mech
+            && los_enemies == 0
+            && !urgent_dodge
+            && !ceasefire_for_regen
+            && !ffa_hold
+            && (38.0..=200.0).contains(&t.dist)
+        {
+            // Verified corner pre-charge: only start if enemy rounds corner in 0.55 s OR
+            // a walkable 4.5-8.0 m lateral peek gives direct LOS.
+            let pred_t = [
+                t.pos[0] + t.vel[0] * 0.55,
+                t.pos[1] + t.vel[1] * 0.55,
+                t.pos[2],
+            ];
+            let enemy_peeking_soon = world.raycast_solid(muzzle, pred_t).is_none();
+            let corner_peek = find_laser_peek_point(obs, cfg, world, t.pos);
+            if enemy_peeking_soon || corner_peek.is_some() {
+                // Allow 0.85 s (0.50 + 0.35 grace) to finish 0.75 s charge and clear corner
+                *laser_last_los_t = obs.t + 0.50;
+                *peek_point = corner_peek;
+                act.aim = if enemy_peeking_soon {
+                    aim_to(muzzle, pred_t)
+                } else {
+                    direct_aim
+                };
+                act.fire[i] = true;
+                return;
+            }
         }
     }
 
-    // 3. Dual-arc Mortar
+    // 3. Smart Dual-arc Mortar (behind cover, clumps, zone knock-outs, anti-lightning, burst)
     if let Some((i, w)) = mortar_slot {
-        let gun_ready = gun_slot.map_or(false, |(_, g)| g.reload <= 0.0 && t.los && t.dist < 140.0);
-        let want_mortar =
-            !t.is_crate && w.cooldown <= 0.08 && (!t.los || t.has_lightning || !gun_ready);
-        if want_mortar {
-            let speed = w.stat_f64("speed", cfg.mortar_speed);
-            if let Some(sol) = solve_mortar(obs, cfg, world, t.pos, t.vel, speed) {
-                act.aim = sol.aim;
-                let yaw_err = angle_diff(obs.me.aim[0], sol.aim[0]).abs();
-                let pitch_err = (obs.me.aim[1] - sol.aim[1]).abs();
-                if yaw_err < 0.06 && pitch_err < 0.06 {
-                    act.fire[i] = true;
+        let splash_radius = w.stat_f64("splash_radius", 7.0);
+        let gun_ready =
+            gun_slot.map_or(false, |(_, g)| g.reload <= 0.0 && t.los && t.dist < 140.0);
+        if !t.is_crate && w.cooldown <= 0.08 && t.dist >= (splash_radius + 4.0).max(11.0) {
+            let (m_pos, m_vel, clumped, zone_knock) =
+                compute_mortar_aim_point(obs, t, splash_radius);
+            let horiz_speed = (t.vel[0] * t.vel[0] + t.vel[1] * t.vel[1]).sqrt();
+            let slow_mid_target = t.is_mech
+                && (28.0..=95.0).contains(&t.dist)
+                && (horiz_speed < 7.5 || t.enemy_charging);
+            let want_mortar = !t.los
+                || clumped
+                || zone_knock
+                || (t.has_lightning && t.dist <= 75.0)
+                || !gun_ready
+                || slow_mid_target;
+
+            if want_mortar {
+                let speed = w.stat_f64("speed", cfg.mortar_speed);
+                if let Some(sol) =
+                    solve_mortar(obs, cfg, world, m_pos, m_vel, speed, splash_radius)
+                {
+                    act.aim = sol.aim;
+                    let pred =
+                        predict_aim_after_step(obs.me.aim, sol.aim, turn_rate, pitch_rate);
+                    let yaw_err = angle_diff(pred[0], sol.aim[0]).abs();
+                    let pitch_err = (pred[1] - sol.aim[1]).abs();
+                    if yaw_err < 0.075 && pitch_err < 0.075 {
+                        act.fire[i] = true;
+                    }
+                    maybe_cover_reload(
+                        obs,
+                        los_enemies,
+                        Some(t),
+                        ceasefire_for_regen,
+                        false,
+                        act,
+                    );
+                    return;
                 }
-                maybe_cover_reload(obs, los_enemies, Some(t), ceasefire_for_regen, false, act);
-                return;
             }
         }
     }
@@ -597,7 +780,7 @@ pub fn decide_combat(
         if t.los && t.dist <= range {
             let lead = lead_aim(muzzle, t.pos, t.vel, speed, world);
             act.aim = lead;
-            let pred = predict_aim_after_step(obs.me.aim, lead, turn_rate);
+            let pred = predict_aim_after_step(obs.me.aim, lead, turn_rate, pitch_rate);
             let yaw_err = angle_diff(pred[0], lead[0]).abs();
             let pitch_err = (pred[1] - lead[1]).abs();
             let hit_tol = (3.4 / t.dist.max(6.0)).clamp(0.035, 0.28);
