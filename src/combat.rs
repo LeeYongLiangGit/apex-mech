@@ -628,7 +628,13 @@ pub fn decide_combat(
     let laser_slot = find_slot("laser");
     let mortar_slot = find_slot("mortar");
     let gun_slot = find_slot("gun");
-    let has_close_weapon = lightning_slot.is_some() || gun_slot.is_some();
+
+    let lightning_can_fire = lightning_slot.map_or(false, |(_, lw)| {
+        let range = lw.stat_f64("range", 45.0);
+        let e_cost = lw.stat_f64("energy", 3.0);
+        t.dist <= range - 0.5 && obs.me.energy >= e_cost + 0.05
+    });
+    let has_close_weapon = gun_slot.is_some() || lightning_can_fire;
 
     let laser_charging = laser_slot.map_or(false, |(_, w)| w.charge > 0.0);
     if laser_charging && t.los {
@@ -657,7 +663,12 @@ pub fn decide_combat(
         if let Some((li, lw)) = lightning_slot {
             let range = lw.stat_f64("range", 45.0);
             let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
-            let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
+            let e_cost = lw.stat_f64("energy", 3.0);
+            let energy_min = if t.enemy_charging || t.hp <= 220.0 || gun_slot.is_none() {
+                e_cost + 0.05
+            } else {
+                7.0_f64.max(e_cost + 0.05)
+            };
             if t.los && t.dist <= range - 0.5 && obs.me.energy >= energy_min {
                 let mut chosen_aim = direct_aim;
                 let mut dual_gun: Option<(usize, [f64; 2])> = None;
@@ -757,7 +768,12 @@ pub fn decide_combat(
                 if let Some((li, lw)) = lightning_slot {
                     let l_range = lw.stat_f64("range", 45.0);
                     let l_cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.48;
-                    let energy_min = if t.enemy_charging || t.hp <= 220.0 { 3.1 } else { 7.0 };
+                    let e_cost = lw.stat_f64("energy", 3.0);
+                    let energy_min = if t.enemy_charging || t.hp <= 220.0 || gun_slot.is_none() {
+                        e_cost + 0.05
+                    } else {
+                        7.0_f64.max(e_cost + 0.05)
+                    };
                     if t.dist <= l_range - 0.5
                         && obs.me.energy >= energy_min
                         && angle_diff(pred[0], direct_aim[0]).abs() <= l_cone
