@@ -725,6 +725,7 @@ impl BotBrain {
         let gun_w = find_w("gun");
 
         let has_lightning = lightning_w.is_some();
+        let lightning_range = lightning_w.map_or(45.0, |w| w.stat_f64("range", 45.0));
         let has_laser = laser_w.is_some();
         let laser_charging = laser_w.map_or(false, |w| w.charge > 0.0);
 
@@ -830,8 +831,14 @@ impl BotBrain {
 
         // Duck briefly behind cover during zero-DPS burst cooldowns
         let lightning_active = lightning_w.map_or(false, |w| {
-            let rng = w.stat_f64("range", 45.0);
-            obs.me.energy >= 7.0 && primary_mech.map_or(false, |pm| pm.los && pm.dist <= rng + 4.0)
+            let e_cost = w.stat_f64("energy", 3.0);
+            let e_min = if gun_w.is_none() {
+                e_cost + 0.05
+            } else {
+                7.0_f64.max(e_cost + 0.05)
+            };
+            obs.me.energy >= e_min
+                && primary_mech.map_or(false, |pm| pm.los && pm.dist <= lightning_range + 4.0)
         });
         let gun_active = gun_w.map_or(false, |w| w.reload <= 0.25 && w.ammo.unwrap_or(1) > 0);
         let burst_on_cd = laser_w.map_or(false, |w| w.cooldown > 0.35 && w.charge <= 0.0)
@@ -843,16 +850,16 @@ impl BotBrain {
             && !gun_active
             && !seek_heal;
 
-        // Stay at the edge of lightning range (37 m) for max bullet-dodging space;
+        // Stay at the edge of live lightning range for max bullet-dodging space;
         // only hold laser distance against mortar bots if we actually carry a laser
         let ideal_dist = if let Some(pm) = primary_mech {
             if seek_heal || los_enemies >= 2 {
                 90.0
             } else if has_lightning
                 && obs.me.energy >= 20.0
-                && (!pm.has_mortar || !has_laser || pm.dist <= 48.0)
+                && (!pm.has_mortar || !has_laser || pm.dist <= lightning_range + 3.0)
             {
-                37.0
+                (lightning_range - 8.0).max(20.0)
             } else if pm.has_lightning && !has_lightning {
                 68.0
             } else if has_laser {

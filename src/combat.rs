@@ -371,11 +371,13 @@ pub fn select_target(
         .weapons
         .iter()
         .any(|w| w.as_ref().map_or(false, |s| s.kind == "laser"));
-    let has_lightning = obs
+    let lightning_range = obs
         .me
         .weapons
         .iter()
-        .any(|w| w.as_ref().map_or(false, |s| s.kind == "lightning"));
+        .flatten()
+        .find(|w| w.kind == "lightning")
+        .map(|w| w.stat_f64("range", 45.0));
 
     let mut best_mech: Option<TargetInfo> = None;
     let mut best_npc: Option<TargetInfo> = None;
@@ -423,14 +425,18 @@ pub fn select_target(
         if prev_target_id == Some(m.id as u64) && los {
             score += 140.0;
         }
-        if has_lightning && d <= 44.0 && los {
+        if lightning_range.map_or(false, |r| d <= r - 1.0) && los {
             score += 240.0;
         }
         if rear_exposed && is_mech {
             score += 170.0;
         }
         if m.charging {
-            score += if has_lightning && d <= 45.0 { 460.0 } else { 200.0 };
+            score += if lightning_range.map_or(false, |r| d <= r) {
+                460.0
+            } else {
+                200.0
+            };
         }
         if has_laser && enemy_mortar && los {
             score += 220.0;
@@ -722,11 +728,12 @@ pub fn decide_combat(
         let base_dmg = w.stat_f64("damage", 315.0);
         let hold_s = w.stat_f64("hold_s", 2.0);
 
+        let close_thresh = lightning_slot.map_or(45.0, |(_, lw)| lw.stat_f64("range", 45.0));
         let multi_enemy_ok = los_enemies <= 1 || t.has_mortar || t.dist > 50.0;
         let safe_los_charge = !t.is_crate
             && t.los
             && t.dist <= range
-            && (t.dist > 45.0 || !has_close_weapon)
+            && (t.dist > close_thresh || !has_close_weapon)
             && multi_enemy_ok
             && !urgent_dodge;
 
