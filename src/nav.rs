@@ -1,792 +1,462 @@
-use crate::world::{point_in_prism_2d, World};
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use crate::world::World;
 use std::f64::consts::PI;
+use std::time::Instant;
 
-const NAV_STEP: f64 = 4.0;
-const MAX_CLIMB_M: f64 = 46.0;
-
-const DIRS: [(isize, isize, f32); 8] = [
-    (1, 0, 4.0),
-    (-1, 0, 4.0),
-    (0, 1, 4.0),
-    (0, -1, 4.0),
-    (1, 1, 5.657),
-    (1, -1, 5.657),
-    (-1, 1, 5.657),
-    (-1, -1, 5.657),
-];
-
-#[derive(Debug, Clone, Copy)]
-pub struct Waypoint {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-    pub layer: usize,
-}
-
-#[derive(Clone, Copy)]
-struct NavCell {
-    ground_z: f32,
-    roof_z: f32,
-    blocked_ground: bool,
-    near_cover: bool,
-}
-
-#[derive(Clone, Copy)]
-struct OpenNode {
-    f: f32,
-    idx: usize,
-}
-
-impl PartialEq for OpenNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.f.to_bits() == other.f.to_bits() && self.idx == other.idx
-    }
-}
-impl Eq for OpenNode {}
-
-impl Ord for OpenNode {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .f
-            .total_cmp(&self.f)
-            .then_with(|| self.idx.cmp(&other.idx))
-    }
-}
-impl PartialOrd for OpenNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+const INF: f32 = 1e9;
 
 pub struct NavEngine {
     min_x: f64,
     min_y: f64,
-    nx: usize,
-    ny: usize,
-    step_up: f32,
-    cells: Vec<NavCell>,
-    g_score: Vec<f32>,
-    parent: Vec<u32>,
-    stamp: Vec<u32>,
-    cur_stamp: u32,
-    cached_goal: [f64; 3],
-    cached_path: Vec<Waypoint>,
-    last_plan_tick: u64,
+    nnx: usize,
+    nny: usize,
+    walk: Vec<u8>,
+    dist: Vec<f32>,
+    work: Vec<f32>,
+    hk: Vec<f32>,
+    hv: Vec<u32>,
+    goal_key: Option<(i32, i32)>,
+    pending_key: Option<(i32, i32)>,
+    pending_goal: [f64; 2],
+    ready_goal: Option<[f64; 2]>,
 }
 
 impl NavEngine {
     pub fn build(world: &World, step_up: f64, max_slope_deg: f64) -> Self {
-        let nx = (((world.max_x - world.min_x) / NAV_STEP).ceil() as usize).max(1);
-        let ny = (((world.max_y - world.min_y) / NAV_STEP).ceil() as usize).max(1);
-        let total = nx * ny;
-        let max_slope_dz = (max_slope_deg.to_radians().tan() * NAV_STEP) as f32;
+        let min_x = world.min_x;
+        let min_y = world.min_y;
+        let nx = ((world.max_x - min_x).ceil() as usize).max(2) + 1;
+        let ny = ((world.max_y - min_y).ceil() as usize).max(2) + 1;
+        let n1 = nx * ny;
 
-        let mut cells = vec![
-            NavCell {
-                ground_z: 0.0,
-                roof_z: f32::NEG_INFINITY,
-                blocked_ground: false,
-                near_cover: false,
-            };
-            total
-        ];
-        let mut max_prism_top = vec![f32::NEG_INFINITY; total];
-
-        for gy in 0..ny {
-            let cy = world.min_y + (gy as f64 + 0.5) * NAV_STEP;
-            for gx in 0..nx {
-                let cx = world.min_x + (gx as f64 + 0.5) * NAV_STEP;
-                cells[gy * nx + gx].ground_z = world.terrain_height(cx, cy) as f32;
+        let mut ground = vec![0.0_f32; n1];
+        for j in 0..ny {
+            let y = min_y + j as f64;
+            for i in 0..nx {
+                let x = min_x + i as f64;
+                ground[j * nx + i] = world.terrain_height(x, y) as f32;
             }
         }
 
-        for gy in 0..ny {
-            for gx in 0..nx {
-                let idx = gy * nx + gx;
-                if gx == 0 || gy == 0 || gx + 1 == nx || gy + 1 == ny {
-                    cells[idx].blocked_ground = true;
-                    continue;
-                }
-                let z = cells[idx].ground_z;
-                let max_diff = (cells[idx - 1].ground_z - z)
-                    .abs()
-                    .max((cells[idx + 1].ground_z - z).abs())
-                    .max((cells[idx - nx].ground_z - z).abs())
-                    .max((cells[idx + nx].ground_z - z).abs());
-                if max_diff > max_slope_dz {
-                    cells[idx].blocked_ground = true;
-                }
-            }
-        }
+        let mut top = vec![-INF; n1];
+        let mut base = vec![INF; n1];
+        let mut xs: Vec<f64> = Vec::with_capacity(16);
 
-        let clearance = 3.8;
-        let diag = clearance * 0.7071;
         for p in &world.prisms {
-            let gx0 = (((p.min_x - clearance - world.min_x) / NAV_STEP).floor() as isize)
-                .clamp(0, nx as isize - 1) as usize;
-            let gx1 = (((p.max_x + clearance - world.min_x) / NAV_STEP).ceil() as isize)
-                .clamp(0, nx as isize - 1) as usize;
-            let gy0 = (((p.min_y - clearance - world.min_y) / NAV_STEP).floor() as isize)
-                .clamp(0, ny as isize - 1) as usize;
-            let gy1 = (((p.max_y + clearance - world.min_y) / NAV_STEP).ceil() as isize)
-                .clamp(0, ny as isize - 1) as usize;
+            let j0 = ((p.min_y - min_y).floor() as isize).clamp(0, ny as isize - 1) as usize;
+            let j1 = ((p.max_y - min_y).ceil() as isize).clamp(0, ny as isize - 1) as usize;
+            let top_f = p.top as f32;
+            let base_f = p.base as f32;
 
-            for gy in gy0..=gy1 {
-                let cy = world.min_y + (gy as f64 + 0.5) * NAV_STEP;
-                for gx in gx0..=gx1 {
-                    let cx = world.min_x + (gx as f64 + 0.5) * NAV_STEP;
-                    let center_in = point_in_prism_2d(cx, cy, p);
-                    let margin_in = center_in
-                        || point_in_prism_2d(cx + clearance, cy, p)
-                        || point_in_prism_2d(cx - clearance, cy, p)
-                        || point_in_prism_2d(cx, cy + clearance, p)
-                        || point_in_prism_2d(cx, cy - clearance, p)
-                        || point_in_prism_2d(cx + diag, cy + diag, p)
-                        || point_in_prism_2d(cx + diag, cy - diag, p)
-                        || point_in_prism_2d(cx - diag, cy + diag, p)
-                        || point_in_prism_2d(cx - diag, cy - diag, p);
-                    if !margin_in {
-                        continue;
+            for j in j0..=j1 {
+                let y = min_y + j as f64 + 0.0001;
+                xs.clear();
+
+                let mut add_edges = |ring: &[[f64; 2]]| {
+                    let m = ring.len();
+                    if m < 3 {
+                        return;
                     }
-
-                    let idx = gy * nx + gx;
-                    let gz = cells[idx].ground_z as f64;
-                    if center_in && (p.top as f32) > max_prism_top[idx] {
-                        max_prism_top[idx] = p.top as f32;
+                    for a in 0..m {
+                        let b = (a + 1) % m;
+                        let (ax, ay) = (ring[a][0], ring[a][1]);
+                        let (bx, by) = (ring[b][0], ring[b][1]);
+                        if (ay <= y && by > y) || (by <= y && ay > y) {
+                            xs.push(ax + ((y - ay) / (by - ay)) * (bx - ax));
+                        }
                     }
+                };
 
-                    if p.top <= gz + step_up && p.top > gz {
-                        cells[idx].ground_z = p.top as f32;
-                    } else if p.base < gz + 11.5 {
-                        cells[idx].blocked_ground = true;
+                add_edges(&p.ring);
+                for hole in &p.holes {
+                    add_edges(hole);
+                }
+
+                xs.sort_by(|a, b| a.total_cmp(b));
+                let mut k = 0;
+                while k + 1 < xs.len() {
+                    let raw_i0 = (xs[k] - min_x).ceil() as isize;
+                    let raw_i1 = (xs[k + 1] - min_x).floor() as isize;
+                    if raw_i1 >= 0 && raw_i0 < nx as isize && raw_i0 <= raw_i1 {
+                        let i0 = raw_i0.max(0) as usize;
+                        let i1 = raw_i1.min(nx as isize - 1) as usize;
+                        for i in i0..=i1 {
+                            let idx = j * nx + i;
+                            if top_f > top[idx] {
+                                top[idx] = top_f;
+                            }
+                            if base_f < base[idx] {
+                                base[idx] = base_f;
+                            }
+                        }
                     }
+                    k += 2;
+                }
+            }
+        }
 
-                    if center_in && p.top > gz + step_up && (p.top - gz) <= MAX_CLIMB_M {
-                        if (p.top as f32) > cells[idx].roof_z {
-                            cells[idx].roof_z = p.top as f32;
+        let nnx = nx.div_ceil(2);
+        let nny = ny.div_ceil(2);
+        let total = nnx * nny;
+        let mut walk = vec![0_u8; total];
+        let step_up_f = step_up as f32;
+        let max_slope_dz = ((max_slope_deg.to_radians().tan() * 2.0) as f32).min(2.2);
+
+        for jj in 0..nny {
+            for ii in 0..nnx {
+                let mut ok = 1_u8;
+                'window: for dj in -2_isize..=3 {
+                    for di in -2_isize..=3 {
+                        let i = ii as isize * 2 + di;
+                        let j = jj as isize * 2 + dj;
+                        if i < 0 || j < 0 || i >= nx as isize || j >= ny as isize {
+                            ok = 0;
+                            break 'window;
+                        }
+                        let k = j as usize * nx + i as usize;
+                        let g = ground[k];
+                        if top[k] > g + step_up_f && base[k] < g + 9.5 {
+                            ok = 0;
+                            break 'window;
                         }
                     }
                 }
-            }
-        }
-
-        for gy in 1..(ny - 1) {
-            for gx in 1..(nx - 1) {
-                let idx = gy * nx + gx;
-                if cells[idx].roof_z.is_finite()
-                    && max_prism_top[idx] > cells[idx].roof_z + step_up as f32
-                {
-                    cells[idx].roof_z = f32::NEG_INFINITY;
-                }
-                if !cells[idx].blocked_ground {
-                    cells[idx].near_cover = cells[idx - 1].blocked_ground
-                        || cells[idx + 1].blocked_ground
-                        || cells[idx - nx].blocked_ground
-                        || cells[idx + nx].blocked_ground;
-                }
-            }
-        }
-
-        let num_states = total * 2;
-        Self {
-            min_x: world.min_x,
-            min_y: world.min_y,
-            nx,
-            ny,
-            step_up: step_up as f32,
-            cells,
-            g_score: vec![f32::INFINITY; num_states],
-            parent: vec![u32::MAX; num_states],
-            stamp: vec![0; num_states],
-            cur_stamp: 0,
-            cached_goal: [0.0; 3],
-            cached_path: Vec::new(),
-            last_plan_tick: 0,
-        }
-    }
-
-    pub fn invalidate_cache(&mut self) {
-        self.cached_path.clear();
-    }
-
-    #[inline]
-    fn world_to_grid(&self, x: f64, y: f64) -> (usize, usize) {
-        let gx = (((x - self.min_x) / NAV_STEP).floor() as isize)
-            .clamp(0, self.nx as isize - 1) as usize;
-        let gy = (((y - self.min_y) / NAV_STEP).floor() as isize)
-            .clamp(0, self.ny as isize - 1) as usize;
-        (gx, gy)
-    }
-
-    #[inline]
-    fn grid_to_world(&self, gx: usize, gy: usize) -> (f64, f64) {
-        (
-            self.min_x + (gx as f64 + 0.5) * NAV_STEP,
-            self.min_y + (gy as f64 + 0.5) * NAV_STEP,
-        )
-    }
-
-    #[inline]
-    fn state_idx(&self, gx: usize, gy: usize, layer: usize) -> usize {
-        layer * (self.nx * self.ny) + gy * self.nx + gx
-    }
-
-    #[inline]
-    fn decode_state(&self, idx: usize) -> (usize, usize, usize) {
-        let total = self.nx * self.ny;
-        let layer = idx / total;
-        let rem = idx % total;
-        (rem % self.nx, rem / self.nx, layer)
-    }
-
-    fn cell_z(&self, gx: usize, gy: usize, layer: usize) -> f32 {
-        let c = self.cells[gy * self.nx + gx];
-        if layer == 1 { c.roof_z } else { c.ground_z }
-    }
-
-    fn is_valid_state(&self, gx: usize, gy: usize, layer: usize) -> bool {
-        let c = self.cells[gy * self.nx + gx];
-        if layer == 0 {
-            !c.blocked_ground
-        } else {
-            c.roof_z.is_finite()
-        }
-    }
-
-    pub fn is_near_cover(&self, x: f64, y: f64) -> bool {
-        let (gx, gy) = self.world_to_grid(x, y);
-        self.cells[gy * self.nx + gx].near_cover
-    }
-
-    fn snap_valid(&self, gx: usize, gy: usize, z: f64) -> (usize, usize, usize) {
-        let c = self.cells[gy * self.nx + gx];
-        if c.roof_z.is_finite() && (z as f32 - c.roof_z).abs() < 3.0 {
-            return (gx, gy, 1);
-        }
-        if !c.blocked_ground && (z as f32 - c.ground_z).abs() < 4.5 {
-            return (gx, gy, 0);
-        }
-        let mut best = (gx, gy, 0);
-        let mut best_cost = f32::INFINITY;
-        for r in 1..=3_isize {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let nx = gx as isize + dx;
-                    let ny = gy as isize + dy;
-                    if nx < 0 || ny < 0 || nx >= self.nx as isize || ny >= self.ny as isize {
-                        continue;
+                if ok == 1 && nx >= 3 && ny >= 3 {
+                    let i = (ii * 2).min(nx - 3);
+                    let j = (jj * 2).min(ny - 3);
+                    let g = ground[j * nx + i];
+                    if (ground[j * nx + i + 2] - g).abs() > max_slope_dz
+                        || (ground[(j + 2) * nx + i] - g).abs() > max_slope_dz
+                    {
+                        ok = 0;
                     }
-                    let (ux, uy) = (nx as usize, ny as usize);
-                    for layer in 0..2 {
-                        if !self.is_valid_state(ux, uy, layer) {
+                }
+                walk[jj * nnx + ii] = ok;
+            }
+        }
+
+        Self {
+            min_x,
+            min_y,
+            nnx,
+            nny,
+            walk,
+            dist: vec![INF; total],
+            work: vec![INF; total],
+            hk: Vec::with_capacity(total),
+            hv: Vec::with_capacity(total),
+            goal_key: None,
+            pending_key: None,
+            pending_goal: [0.0, 0.0],
+            ready_goal: None,
+        }
+    }
+
+    #[inline]
+    pub fn cell_of(&self, x: f64, y: f64) -> usize {
+        let i = (((x - self.min_x) * 0.5).round() as isize)
+            .clamp(0, self.nnx as isize - 1) as usize;
+        let j = (((y - self.min_y) * 0.5).round() as isize)
+            .clamp(0, self.nny as isize - 1) as usize;
+        j * self.nnx + i
+    }
+
+    pub fn walk_segment(&self, x: f64, y: f64, gx: f64, gy: f64) -> bool {
+        let mut prev = self.cell_of(x, y);
+        if self.walk[prev] == 0 {
+            return true;
+        }
+        let steps = ((gx - x).hypot(gy - y).ceil() as usize).max(1);
+        for step in 1..=steps {
+            let f = step as f64 / steps as f64;
+            let cell = self.cell_of(x + (gx - x) * f, y + (gy - y) * f);
+            if self.walk[cell] == 0 {
+                return false;
+            }
+            let dx = (cell % self.nnx) as isize - (prev % self.nnx) as isize;
+            let dy = (cell / self.nnx) as isize - (prev / self.nnx) as isize;
+            if dx != 0 && dy != 0 && dx.abs() == 1 && dy.abs() == 1 {
+                let c1 = (prev as isize + dx) as usize;
+                let c2 = (prev as isize + dy * self.nnx as isize) as usize;
+                if self.walk[c1] == 0 || self.walk[c2] == 0 {
+                    return false;
+                }
+            }
+            prev = cell;
+        }
+        true
+    }
+
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.pending_key.is_some()
+    }
+
+    pub fn field(&mut self, gx: f64, gy: f64) {
+        let key = ((gx / 5.0).round() as i32, (gy / 5.0).round() as i32);
+        if self.pending_key == Some(key) {
+            return;
+        }
+        if self.pending_key.is_none() && self.goal_key == Some(key) {
+            return;
+        }
+        if self.pending_key.is_some()
+            && (gx - self.pending_goal[0]).hypot(gy - self.pending_goal[1]) < 25.0
+        {
+            return;
+        }
+
+        self.work.fill(INF);
+        self.hk.clear();
+        self.hv.clear();
+
+        let mut g = self.cell_of(gx, gy);
+        if self.walk[g] == 0 {
+            let w = self.nnx as isize;
+            let h = self.nny as isize;
+            let gi = (g % self.nnx) as isize;
+            let gj = (g / self.nnx) as isize;
+            let mut best: Option<usize> = None;
+            let mut best_d2 = isize::MAX;
+            for r in 1..30_isize {
+                for dj in -r..=r {
+                    for di in -r..=r {
+                        let i = gi + di;
+                        let j = gj + dj;
+                        if i < 0 || j < 0 || i >= w || j >= h {
                             continue;
                         }
-                        let cz = self.cell_z(ux, uy, layer);
-                        let cost =
-                            ((dx * dx + dy * dy) as f32).sqrt() * 4.0 + (cz - z as f32).abs();
-                        if cost < best_cost {
-                            best_cost = cost;
-                            best = (ux, uy, layer);
+                        let k = j as usize * self.nnx + i as usize;
+                        let d2 = di * di + dj * dj;
+                        if self.walk[k] != 0 && d2 < best_d2 {
+                            best_d2 = d2;
+                            best = Some(k);
                         }
                     }
                 }
-            }
-            if best_cost.is_finite() {
-                break;
-            }
-        }
-        best
-    }
-
-    pub fn next_waypoint(
-        &mut self,
-        tick: u64,
-        pos: [f64; 3],
-        goal: [f64; 3],
-        allow_jet: bool,
-    ) -> Waypoint {
-        let goal_shift = ((goal[0] - self.cached_goal[0]).powi(2)
-            + (goal[1] - self.cached_goal[1]).powi(2)
-            + (goal[2] - self.cached_goal[2]).powi(2))
-        .sqrt();
-        let need_replan = self.cached_path.is_empty()
-            || tick.saturating_sub(self.last_plan_tick) >= 8
-            || goal_shift > 12.0;
-
-        if need_replan {
-            self.cached_path = self.find_path(pos, goal, allow_jet);
-            self.cached_goal = goal;
-            self.last_plan_tick = tick;
-        }
-
-        while self.cached_path.len() > 1 {
-            let wp = self.cached_path[0];
-            let dh = ((wp.x - pos[0]).powi(2) + (wp.y - pos[1]).powi(2)).sqrt();
-            let dz = (wp.z - pos[2]).abs();
-            if dh < 5.5 && dz < 3.0 {
-                self.cached_path.remove(0);
-            } else {
-                break;
-            }
-        }
-
-        if let Some(&wp) = self.cached_path.first() {
-            if self.cached_path.len() >= 2 {
-                let w2 = self.cached_path[1];
-                if w2.layer == wp.layer && (w2.z - wp.z).abs() <= self.step_up as f64 {
-                    return w2;
+                if best.is_some() {
+                    break;
                 }
             }
-            wp
-        } else {
-            Waypoint {
-                x: goal[0],
-                y: goal[1],
-                z: goal[2],
-                layer: 0,
+            if let Some(bk) = best {
+                g = bk;
             }
         }
+
+        self.work[g] = 0.0;
+        self.push(g as u32, 0.0);
+        self.pending_key = Some(key);
+        self.pending_goal = [gx, gy];
     }
 
-    fn find_path(
-        &mut self,
-        start_pos: [f64; 3],
-        goal_pos: [f64; 3],
-        allow_jet: bool,
-    ) -> Vec<Waypoint> {
-        let (sgx, sgy) = self.world_to_grid(start_pos[0], start_pos[1]);
-        let (ggx, ggy) = self.world_to_grid(goal_pos[0], goal_pos[1]);
-
-        let (sx, sy, sl) = self.snap_valid(sgx, sgy, start_pos[2]);
-        let (tx, ty, tl) = self.snap_valid(ggx, ggy, goal_pos[2]);
-
-        let start_idx = self.state_idx(sx, sy, sl);
-        let goal_idx = self.state_idx(tx, ty, tl);
-        if start_idx == goal_idx {
-            return vec![Waypoint {
-                x: goal_pos[0],
-                y: goal_pos[1],
-                z: goal_pos[2],
-                layer: tl,
-            }];
-        }
-
-        self.cur_stamp = self.cur_stamp.wrapping_add(1);
-        if self.cur_stamp == 0 {
-            self.stamp.fill(0);
-            self.cur_stamp = 1;
-        }
-        let stamp = self.cur_stamp;
-
-        let mut open = BinaryHeap::with_capacity(512);
-        self.stamp[start_idx] = stamp;
-        self.g_score[start_idx] = 0.0;
-        self.parent[start_idx] = u32::MAX;
-
-        let heuristic = |gx: usize, gy: usize| -> f32 {
-            let dx = (gx as f32 - tx as f32) * NAV_STEP as f32;
-            let dy = (gy as f32 - ty as f32) * NAV_STEP as f32;
-            (dx * dx + dy * dy).sqrt()
-        };
-
-        open.push(OpenNode {
-            f: heuristic(sx, sy),
-            idx: start_idx,
-        });
-
-        let mut best_idx = start_idx;
-        let mut best_h = heuristic(sx, sy);
-        let mut expansions = 0_usize;
-        const MAX_EXPANSIONS: usize = 1200;
-
-        while let Some(OpenNode { idx, .. }) = open.pop() {
-            if idx == goal_idx {
-                best_idx = idx;
+    #[inline]
+    fn push(&mut self, k: u32, v: f32) {
+        let mut i = self.hk.len();
+        self.hk.push(v);
+        self.hv.push(k);
+        while i > 0 {
+            let p = (i - 1) >> 1;
+            if self.hk[p] <= v {
                 break;
             }
-            expansions += 1;
-            if expansions >= MAX_EXPANSIONS {
-                break;
+            self.hk[i] = self.hk[p];
+            self.hv[i] = self.hv[p];
+            i = p;
+        }
+        self.hk[i] = v;
+        self.hv[i] = k;
+    }
+
+    #[inline]
+    fn pop(&mut self) -> (f32, u32) {
+        let top_v = self.hk[0];
+        let top_k = self.hv[0];
+        let lv = self.hk.pop().unwrap();
+        let lk = self.hv.pop().unwrap();
+        let n = self.hk.len();
+        if n > 0 {
+            let mut i = 0;
+            loop {
+                let mut c = 2 * i + 1;
+                if c >= n {
+                    break;
+                }
+                if c + 1 < n && self.hk[c + 1] < self.hk[c] {
+                    c += 1;
+                }
+                if self.hk[c] >= lv {
+                    break;
+                }
+                self.hk[i] = self.hk[c];
+                self.hv[i] = self.hv[c];
+                i = c;
             }
+            self.hk[i] = lv;
+            self.hv[i] = lk;
+        }
+        (top_v, top_k)
+    }
 
-            let cur_g = self.g_score[idx];
-            let (cx, cy, cl) = self.decode_state(idx);
-            let cz = self.cell_z(cx, cy, cl);
+    pub fn pump(&mut self, budget_ms: f64, max_iter: usize) {
+        if self.pending_key.is_none() || budget_ms <= 0.0 {
+            return;
+        }
+        let w = self.nnx;
+        let h = self.nny;
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let t0 = Instant::now();
+        let mut iter = 0_usize;
 
-            let h_cur = heuristic(cx, cy);
-            if h_cur < best_h {
-                best_h = h_cur;
-                best_idx = idx;
+        while !self.hk.is_empty() {
+            iter += 1;
+            if iter > max_iter {
+                return;
             }
+            if (iter & 1023) == 0 && t0.elapsed().as_secs_f64() * 1000.0 > budget_ms {
+                return;
+            }
+            let (v0, k_u32) = self.pop();
+            let k = k_u32 as usize;
+            if v0 > self.work[k] {
+                continue;
+            }
+            let i = (k % w) as isize;
+            let j = (k / w) as isize;
 
-            for &(dx, dy, dist) in &DIRS {
-                let nx = cx as isize + dx;
-                let ny = cy as isize + dy;
-                if nx < 0 || ny < 0 || nx >= self.nx as isize || ny >= self.ny as isize {
+            for dj in -1_isize..=1 {
+                let jj = j + dj;
+                if jj < 0 || jj >= h as isize {
                     continue;
                 }
-                let (ux, uy) = (nx as usize, ny as usize);
-
-                for nl in 0..2 {
-                    if !self.is_valid_state(ux, uy, nl) {
+                let jju = jj as usize;
+                let ju = j as usize;
+                for di in -1_isize..=1 {
+                    if di == 0 && dj == 0 {
                         continue;
                     }
-                    let nz = self.cell_z(ux, uy, nl);
-                    let dz = nz - cz;
-
-                    let step_cost = if dz <= self.step_up {
-                        if cl == 1 && nl == 0 {
-                            dist + 2.0
-                        } else {
-                            dist
-                        }
-                    } else if allow_jet && nl == 1 && dz <= MAX_CLIMB_M as f32 {
-                        dist + 20.0 + dz * 1.6
-                    } else {
+                    let ii = i + di;
+                    if ii < 0 || ii >= w as isize {
                         continue;
-                    };
-
-                    let nidx = self.state_idx(ux, uy, nl);
-                    let ng = cur_g + step_cost;
-                    let visited = self.stamp[nidx] == stamp;
-                    if !visited || ng < self.g_score[nidx] {
-                        self.stamp[nidx] = stamp;
-                        self.g_score[nidx] = ng;
-                        self.parent[nidx] = idx as u32;
-                        open.push(OpenNode {
-                            f: ng + heuristic(ux, uy) * 1.2,
-                            idx: nidx,
-                        });
+                    }
+                    let iiu = ii as usize;
+                    let kk = jju * w + iiu;
+                    if self.walk[kk] == 0 {
+                        continue;
+                    }
+                    if di != 0 && dj != 0 {
+                        let iu = i as usize;
+                        if self.walk[ju * w + iiu] == 0 || self.walk[jju * w + iu] == 0 {
+                            continue;
+                        }
+                    }
+                    let nv = v0 + if di != 0 && dj != 0 { sqrt2 } else { 1.0 };
+                    if nv < self.work[kk] {
+                        self.work[kk] = nv;
+                        self.push(kk as u32, nv);
                     }
                 }
             }
         }
 
-        let mut rev = Vec::with_capacity(64);
-        let mut cur = best_idx;
-        while cur != u32::MAX as usize {
-            let (gx, gy, layer) = self.decode_state(cur);
-            let (wx, wy) = self.grid_to_world(gx, gy);
-            let wz = self.cell_z(gx, gy, layer) as f64;
-            rev.push(Waypoint {
-                x: wx,
-                y: wy,
-                z: wz,
-                layer,
-            });
-            let p = self.parent[cur];
-            if p == u32::MAX {
-                break;
-            }
-            cur = p as usize;
-        }
-        rev.reverse();
-        if rev.len() > 1 {
-            rev.remove(0);
-        }
-        rev
+        std::mem::swap(&mut self.dist, &mut self.work);
+        self.goal_key = self.pending_key.take();
+        self.ready_goal = Some(self.pending_goal);
     }
 
-    /// Bounded 360-degree Dijkstra over walkable cells (up to 58 m walk distance).
-    /// Buckets reachable cover spots into 12 angular sectors x 2 distance rings so
-    /// every direction gets evaluated and no through-wall unreachable spot is picked.
-    pub fn find_escape_cover(
-        &mut self,
-        pos: [f64; 3],
-        my_eye_off: f64,
-        threat_eyes: &[[f64; 3]],
-        escape_dir: [f64; 2],
-        want_zero_los: bool,
-        allow_roof: bool,
-        world: &World,
-        zone_center: [f64; 2],
-        zone_radius: f64,
-        next_center: [f64; 2],
-        next_radius: f64,
-    ) -> Option<[f64; 3]> {
-        if threat_eyes.is_empty() {
+    pub fn field_for(&self, gx: f64, gy: f64, tol: f64) -> bool {
+        self.ready_goal
+            .map_or(false, |rg| (gx - rg[0]).hypot(gy - rg[1]) < tol)
+    }
+
+    pub fn steer(&self, x: f64, y: f64) -> Option<[f64; 2]> {
+        let w = self.nnx;
+        let h = self.nny;
+        let c = self.cell_of(x, y);
+        let ci = (c % w) as isize;
+        let cj = (c / w) as isize;
+        let start_blocked = self.walk[c] == 0;
+        let mut best = self.dist[c];
+        let mut bi = 0_isize;
+        let mut bj = 0_isize;
+
+        for a in 0..24 {
+            let ang = (a as f64 / 24.0) * 2.0 * PI;
+            let ca = ang.cos();
+            let sa = ang.sin();
+            for r in 1..=5 {
+                let i = ci + (ca * r as f64).round() as isize;
+                let j = cj + (sa * r as f64).round() as isize;
+                if i < 0 || j < 0 || i >= w as isize || j >= h as isize {
+                    break;
+                }
+                let k = j as usize * w + i as usize;
+                if self.walk[k] == 0 {
+                    if start_blocked && r <= 2 {
+                        continue;
+                    }
+                    break;
+                }
+                let v = self.dist[k] + r as f32 * 0.02;
+                if v < best {
+                    best = v;
+                    bi = i - ci;
+                    bj = j - cj;
+                }
+            }
+        }
+
+        if bi == 0 && bj == 0 {
             return None;
         }
-
-        let (sgx, sgy) = self.world_to_grid(pos[0], pos[1]);
-        let (sx, sy, sl) = self.snap_valid(sgx, sgy, pos[2]);
-        let start_idx = self.state_idx(sx, sy, sl);
-
-        self.cur_stamp = self.cur_stamp.wrapping_add(1);
-        if self.cur_stamp == 0 {
-            self.stamp.fill(0);
-            self.cur_stamp = 1;
-        }
-        let stamp = self.cur_stamp;
-
-        let mut open = BinaryHeap::with_capacity(256);
-        self.stamp[start_idx] = stamp;
-        self.g_score[start_idx] = 0.0;
-        open.push(OpenNode {
-            f: 0.0,
-            idx: start_idx,
-        });
-
-        let safe_r = (zone_radius - 6.0).max(6.0);
-        let safe_next_r = (next_radius - 8.0).max(4.0);
-        const MAX_WALK_DIST: f32 = 58.0;
-        const MAX_EXPANSIONS: usize = 260;
-
-        // 12 sectors x 2 rings (near: 4..22 m walk, mid: 22..58 m walk)
-        // Tuple: (pre_score, walk_dist, cand_pt, use_roof)
-        let mut buckets: [Option<(f64, f64, [f64; 3], bool)>; 24] = [None; 24];
-        let mut expansions = 0_usize;
-
-        while let Some(OpenNode { f: cur_g, idx }) = open.pop() {
-            if cur_g > self.g_score[idx] + 1e-3 {
-                continue;
-            }
-            if cur_g > MAX_WALK_DIST {
-                break;
-            }
-            expansions += 1;
-            if expansions > MAX_EXPANSIONS {
-                break;
-            }
-
-            let (cx, cy, cl) = self.decode_state(idx);
-            let cz = self.cell_z(cx, cy, cl);
-
-            if cur_g >= 4.0 && cx > 1 && cy > 1 && cx + 1 < self.nx && cy + 1 < self.ny {
-                let c = self.cells[cy * self.nx + cx];
-                let use_roof = allow_roof
-                    && cl == 1
-                    && c.roof_z.is_finite()
-                    && (c.roof_z as f64 - pos[2]) > 4.0
-                    && (c.roof_z as f64 - pos[2]) <= 24.0;
-                let is_cand = (cl == 0 && c.near_cover) || use_roof;
-
-                if is_cand {
-                    let (wx, wy) = self.grid_to_world(cx, cy);
-                    let dist_z =
-                        ((wx - zone_center[0]).powi(2) + (wy - zone_center[1]).powi(2)).sqrt();
-                    if dist_z <= safe_r {
-                        let dist_me =
-                            ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt().max(1.0);
-                        let dir_dot = ((wx - pos[0]) * escape_dir[0]
-                            + (wy - pos[1]) * escape_dir[1])
-                            / dist_me;
-                        let pre_score = dir_dot * 30.0 - (cur_g as f64) * 1.4;
-
-                        let ang = (wy - pos[1]).atan2(wx - pos[0]);
-                        let sec = (((ang + PI) / (2.0 * PI) * 12.0).floor() as isize)
-                            .clamp(0, 11) as usize;
-                        let ring = if cur_g < 22.0 { 0 } else { 1 };
-                        let bidx = sec * 2 + ring;
-
-                        if buckets[bidx].map_or(true, |b| pre_score > b.0) {
-                            buckets[bidx] =
-                                Some((pre_score, cur_g as f64, [wx, wy, cz as f64], use_roof));
-                        }
-                    }
-                }
-            }
-
-            for &(dx, dy, dist) in &DIRS {
-                let nx = cx as isize + dx;
-                let ny = cy as isize + dy;
-                if nx <= 0 || ny <= 0 || nx >= self.nx as isize - 1 || ny >= self.ny as isize - 1 {
-                    continue;
-                }
-                let (ux, uy) = (nx as usize, ny as usize);
-
-                let max_layer = if allow_roof || cl == 1 { 2 } else { 1 };
-                for nl in 0..max_layer {
-                    if !self.is_valid_state(ux, uy, nl) {
-                        continue;
-                    }
-                    let nz = self.cell_z(ux, uy, nl);
-                    let dz = nz - cz;
-
-                    let step_cost = if dz <= self.step_up {
-                        if cl == 1 && nl == 0 {
-                            dist + 2.0
-                        } else {
-                            dist
-                        }
-                    } else if allow_roof && nl == 1 && dz <= 24.0 {
-                        dist + 18.0 + dz * 1.5
-                    } else {
-                        continue;
-                    };
-
-                    let ng = cur_g + step_cost;
-                    if ng > MAX_WALK_DIST {
-                        continue;
-                    }
-
-                    let nidx = self.state_idx(ux, uy, nl);
-                    let visited = self.stamp[nidx] == stamp;
-                    if !visited || ng < self.g_score[nidx] {
-                        self.stamp[nidx] = stamp;
-                        self.g_score[nidx] = ng;
-                        open.push(OpenNode { f: ng, idx: nidx });
-                    }
-                }
-            }
-        }
-
-        let mut best: Option<(f64, [f64; 3])> = None;
-        for slot in buckets.iter().flatten() {
-            let &(_, walk_dist, cand_pt, use_roof) = slot;
-            let cand_eye = [cand_pt[0], cand_pt[1], cand_pt[2] + my_eye_off];
-
-            let mut los_count = 0_usize;
-            let mut min_threat_d = f64::INFINITY;
-            for &te in threat_eyes {
-                let td = ((cand_pt[0] - te[0]).powi(2) + (cand_pt[1] - te[1]).powi(2)).sqrt();
-                min_threat_d = min_threat_d.min(td);
-                if world.raycast_solid(te, cand_eye).is_none() {
-                    los_count += 1;
-                }
-            }
-
-            let mut score = if want_zero_los {
-                if los_count == 0 {
-                    240.0
-                } else if los_count == 1 {
-                    -35.0
-                } else {
-                    -(los_count as f64) * 130.0
-                }
-            } else if los_count == 1 {
-                210.0
-            } else if los_count == 0 {
-                175.0
-            } else {
-                -(los_count as f64) * 110.0
-            };
-
-            let dist_me = ((cand_pt[0] - pos[0]).powi(2) + (cand_pt[1] - pos[1]).powi(2))
-                .sqrt()
-                .max(1.0);
-            let dir_dot = ((cand_pt[0] - pos[0]) * escape_dir[0]
-                + (cand_pt[1] - pos[1]) * escape_dir[1])
-                / dist_me;
-            score += dir_dot * 42.0;
-            score += min_threat_d.min(85.0) * 1.15;
-            score -= walk_dist * 1.85;
-
-            let d_next = ((cand_pt[0] - next_center[0]).powi(2)
-                + (cand_pt[1] - next_center[1]).powi(2))
-            .sqrt();
-            if d_next > safe_next_r {
-                score -= 22.0;
-            }
-            if use_roof {
-                score += 35.0;
-            }
-
-            if best.map_or(true, |(bs, _)| score > bs) {
-                best = Some((score, cand_pt));
-            }
-        }
-
-        best.map(|(_, p)| p)
+        let l = ((bi * bi + bj * bj) as f64).sqrt();
+        Some([bi as f64 / l, bj as f64 / l])
     }
 
-    /// Nearest walkable ground cover-edge (`near_cover`) cell inside `next_zone`,
-    /// keeping the mech anchored beside building corners instead of the open Oval center.
-    pub fn find_cover_anchor(
+    /// Nearby walkable in-zone point that breaks 3D solid LOS from `primary_eye`
+    /// (and prefers breaking LOS from all active `threat_eyes`).
+    pub fn cover_from(
         &self,
-        pos: [f64; 3],
-        next_center: [f64; 2],
-        next_radius: f64,
-        max_dist: f64,
-    ) -> Option<[f64; 3]> {
-        let (cgx, cgy) = self.world_to_grid(pos[0], pos[1]);
-        let r_cells = (max_dist / NAV_STEP).ceil() as isize;
-        let safe_r = (next_radius - 10.0).max(5.0);
-
-        let mut best: Option<(f64, [f64; 3])> = None;
-        for dy in (-r_cells..=r_cells).step_by(2) {
-            let ny = cgy as isize + dy;
-            if ny <= 1 || ny >= (self.ny as isize - 1) {
-                continue;
-            }
-            for dx in (-r_cells..=r_cells).step_by(2) {
-                let nx = cgx as isize + dx;
-                if nx <= 1 || nx >= (self.nx as isize - 1) {
-                    continue;
-                }
-                let (ux, uy) = (nx as usize, ny as usize);
-                let c = self.cells[uy * self.nx + ux];
-                if c.blocked_ground || !c.near_cover {
-                    continue;
-                }
-                let (wx, wy) = self.grid_to_world(ux, uy);
-                let d_next =
-                    ((wx - next_center[0]).powi(2) + (wy - next_center[1]).powi(2)).sqrt();
-                if d_next > safe_r {
-                    continue;
-                }
-                let d_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();
-                if d_me > max_dist {
-                    continue;
-                }
-                let score = -d_me * 1.0 - d_next * 0.25;
-                if best.map_or(true, |(bs, _)| score > bs) {
-                    best = Some((score, [wx, wy, c.ground_z as f64]));
-                }
-            }
-        }
-        best.map(|(_, p)| p)
-    }
-
-    pub fn find_safe_rooftop(
-        &self,
-        pos: [f64; 3],
+        x: f64,
+        y: f64,
+        my_eye_off: f64,
+        threat_eyes: &[[f64; 3]],
+        primary_eye: [f64; 3],
+        max_r: f64,
         zone_center: [f64; 2],
         zone_radius: f64,
-        max_dist: f64,
-    ) -> Option<[f64; 3]> {
-        let (cgx, cgy) = self.world_to_grid(pos[0], pos[1]);
-        let r_cells = (max_dist / NAV_STEP).ceil() as isize;
-        let safe_r = (zone_radius - 16.0).max(8.0);
-
-        let mut best: Option<(f64, [f64; 3])> = None;
-        for dy in (-r_cells..=r_cells).step_by(2) {
-            let ny = cgy as isize + dy;
-            if ny <= 1 || ny >= (self.ny as isize - 1) {
-                continue;
-            }
-            for dx in (-r_cells..=r_cells).step_by(2) {
-                let nx = cgx as isize + dx;
-                if nx <= 1 || nx >= (self.nx as isize - 1) {
+        world: &World,
+    ) -> Option<[f64; 2]> {
+        let safe_r = (zone_radius - 5.0).max(4.0);
+        let mut best: Option<(f64, [f64; 2])> = None;
+        let mut r = 6.0;
+        while r <= max_r {
+            for a in 0..16 {
+                let ang = (a as f64 / 16.0) * 2.0 * PI;
+                let px = x + ang.cos() * r;
+                let py = y + ang.sin() * r;
+                if self.walk[self.cell_of(px, py)] == 0 {
                     continue;
                 }
-                let (ux, uy) = (nx as usize, ny as usize);
-                let c = self.cells[uy * self.nx + ux];
-                if !c.roof_z.is_finite() {
+                if (px - zone_center[0]).hypot(py - zone_center[1]) > safe_r {
                     continue;
                 }
-                let (wx, wy) = self.grid_to_world(ux, uy);
-                let dist_center =
-                    ((wx - zone_center[0]).powi(2) + (wy - zone_center[1]).powi(2)).sqrt();
-                if dist_center > safe_r {
+                let pz = world.terrain_height(px, py);
+                let cand_eye = [px, py, pz + my_eye_off.min(7.0)];
+                if world.raycast_solid(primary_eye, cand_eye).is_none() {
                     continue;
                 }
-                let climb = (c.roof_z as f64 - c.ground_z as f64).max(0.0);
-                if !(5.0..=30.0).contains(&climb) {
-                    continue;
-                }
-                let d_me = ((wx - pos[0]).powi(2) + (wy - pos[1]).powi(2)).sqrt();
-                if d_me > max_dist {
-                    continue;
-                }
-                let score = climb * 1.3 - d_me * 0.65 - dist_center * 0.25;
-                if best.map_or(true, |(bs, _)| score > bs) {
-                    best = Some((score, [wx, wy, c.roof_z as f64]));
+                let extra_los = threat_eyes
+                    .iter()
+                    .filter(|&&te| world.raycast_solid(te, cand_eye).is_none())
+                    .count();
+                let away = (px - primary_eye[0]).hypot(py - primary_eye[1])
+                    - (x - primary_eye[0]).hypot(y - primary_eye[1]);
+                let s = r - away * 0.3 + extra_los as f64 * 25.0;
+                if best.map_or(true, |(bs, _)| s < bs) {
+                    best = Some((s, [px, py]));
                 }
             }
+            r += 6.0;
         }
-        best.map(|(_, p)| p)
+        best.map(|(_, pt)| pt)
     }
 }

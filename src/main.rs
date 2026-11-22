@@ -2,1077 +2,982 @@ mod belief;
 mod combat;
 mod nav;
 mod protocol;
-mod tactics;
 mod world;
 
-use belief::{BeliefMap, MatchMode};
+use belief::{BeliefMap, MatchMode, TrackedMech};
 use combat::*;
 use nav::NavEngine;
 use protocol::*;
-use std::f64::consts::PI;
 use std::io::{self, BufWriter, Write};
+use std::time::Instant;
 use world::World;
+
+const UPGRADE_PREF: &[&str] = &[
+    "plating",
+    "armor",
+    "nanites",
+    "lightning_efficiency",
+    "laser_damage",
+    "laser_charge",
+    "gun_damage",
+    "gun_rate",
+    "lightning_range",
+    "lightning_chain",
+    "gyros",
+    "servos",
+    "gun_mag",
+    "capacitor",
+    "reactor",
+    "jets",
+    "gun_velocity",
+    "sensors",
+    "mortar_reload",
+    "mortar_velocity",
+    "mortar_splash",
+    "laser_pierce",
+];
+
+#[inline]
+fn weapon_pref(kind: &str) -> f64 {
+    match kind {
+        "laser" => 3.2,
+        "lightning" => 2.5,
+        "mortar" => 1.0,
+        "gun" => 0.0,
+        _ => 0.0,
+    }
+}
 
 struct BotBrain {
     cfg: RuleConfig,
     world: World,
     nav: NavEngine,
     belief: BeliefMap,
-    last_aim: [f64; 2],
-    last_target_id: Option<u64>,
-    laser_last_los_t: f64,
-    strafe_sign: f64,
-    last_strafe_flip: u64,
-    climb_stuck_ticks: u32,
+    rng_state: u32,
+    strafe_dir: f64,
+    strafe_until: f64,
     last_pos: [f64; 3],
-    stuck_ticks: u32,
-    escape_cache: Option<([f64; 3], u64, usize)>,
+    stuck_t: f64,
+    scan_phase: f64,
+    hide_until: f64,
+    target_id: Option<u32>,
+    target_t: f64,
 }
 
 impl BotBrain {
-    fn new(cfg: RuleConfig, world: World) -> Self {
+    fn new(seed: u64, cfg: RuleConfig, world: World) -> Self {
         let nav = NavEngine::build(&world, cfg.step_up, cfg.max_slope_deg);
+        let rng_state = ((seed as u32) ^ ((seed >> 32) as u32)).max(1);
         Self {
             cfg,
             world,
             nav,
             belief: BeliefMap::new(),
-            last_aim: [0.0, 0.0],
-            last_target_id: None,
-            laser_last_los_t: -10.0,
-            strafe_sign: 1.0,
-            last_strafe_flip: 0,
-            climb_stuck_ticks: 0,
+            rng_state,
+            strafe_dir: 1.0,
+            strafe_until: 0.0,
             last_pos: [0.0; 3],
-            stuck_ticks: 0,
-            escape_cache: None,
+            stuck_t: 0.0,
+            scan_phase: 0.0,
+            hide_until: 0.0,
+            target_id: None,
+            target_t: -99.0,
         }
     }
 
-    fn decide(&mut self, obs: &ObsMsg) -> Action {
-        self.belief.update(obs);
-        let mut act = Action::idle(obs.tick, obs.me.aim);
+    fn next_rng(&mut self) -> f64 {
+        let mut s = self.rng_state;
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        self.rng_state = s.max(1);
+        (s as f64) / 4_294_967_296.0
+    }
 
-        let moved = dist_2d(obs.me.pos, self.last_pos);
-        if moved < 0.25 && obs.tick > 10 {
-            self.stuck_ticks = self.stuck_ticks.saturating_add(1);
-            if self.stuck_ticks == 7 {
-                self.nav.invalidate_cache();
-                self.strafe_sign = -self.strafe_sign;
+    fn pick_upgrade(&self, offer: &Offer, obs: &ObsMsg) -> usize {
+        let held_kind = |k: &str| {
+            obs.me
+                .weapons
+                .iter()
+                .flatten()
+                .any(|w| w.kind == k)
+        };
+        let mut best_idx = 0_usize;
+        let mut best_rank = usize::MAX;
+        for (i, c) in offer.choices.iter().enumerate() {
+            let mut rank = UPGRADE_PREF
+                .iter()
+                .position(|&id| id == c.id)
+                .unwrap_or(50);
+            if let Some(def) = self.cfg.upgrades.iter().find(|u| u.id == c.id) {
+                if let Some(req) = &def.requires {
+                    if !held_kind(req) {
+                        rank += 100;
+                    }
+                }
             }
-        } else {
-            self.stuck_ticks = 0;
+            if rank < best_rank {
+                best_rank = rank;
+                best_idx = i;
+            }
         }
-        self.last_pos = obs.me.pos;
+        best_idx
+    }
 
+    /// Returns:
+    /// - `None`: pickup not wanted
+    /// - `Some(None)`: take into empty slot
+    /// - `Some(Some(slot))`: swap out `slot` (never drops `"gun"` or a charging `"laser"`)
+    fn want_kind(&self, obs: &ObsMsg, kind: &str) -> Option<Option<usize>> {
+        let w0 = obs.me.weapons.first().and_then(|s| s.as_ref());
+        let w1 = obs.me.weapons.get(1).and_then(|s| s.as_ref());
+        if w0.map_or(false, |w| w.kind == kind) || w1.map_or(false, |w| w.kind == kind) {
+            return None;
+        }
+        if w0.is_none() || w1.is_none() {
+            return Some(None);
+        }
+        let mut worst_slot: Option<usize> = None;
+        let mut worst_val = f64::INFINITY;
+        for (i, w_opt) in [w0, w1].iter().enumerate() {
+            let Some(w) = w_opt else { continue };
+            if w.kind == "gun" || (w.kind == "laser" && w.charge > 0.0) {
+                continue;
+            }
+            let v = weapon_pref(&w.kind);
+            if v < worst_val {
+                worst_val = v;
+                worst_slot = Some(i);
+            }
+        }
+        if let Some(slot) = worst_slot {
+            if weapon_pref(kind) > worst_val + 0.5 {
+                return Some(Some(slot));
+            }
+        }
+        None
+    }
+
+    fn decide(&mut self, obs: &ObsMsg) -> Action {
+        let tick_t0 = Instant::now();
+        self.belief.update(obs, &self.world);
+
+        let me = &obs.me;
+        let [x, y, z] = me.pos;
+        let t = obs.t;
+        let muzzle_z = z + me.muzzle_height();
+        let eye_off = me.eye_height();
+        let muzzle = [x, y, muzzle_z];
+        let turn_rate = me.turn_rate();
+        let pitch_rate = me.stat_f64("pitch_rate", 3.0);
+        let cube_mult =
+            1.0 + self.cfg.cube_damage_per_cube * (me.cubes.min(self.cfg.cube_stat_cap) as f64);
+
+        let mut act = Action::idle(obs.tick, me.aim);
+
+        // 1. Upgrades
         if let Some(offer) = &obs.offer {
             act.pick = Some(self.pick_upgrade(offer, obs));
         }
 
-        let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
-        let los_enemies = count_los_enemy_mechs(obs, &self.cfg, &self.world);
-        self.handle_weapon_pickup(obs, los_enemies, &mut act);
-
-        let visible_target = select_target(
-            obs,
-            &self.cfg,
-            &self.world,
-            self.belief.mode,
-            self.last_target_id,
-        );
-        self.last_target_id = visible_target.as_ref().filter(|t| t.is_mech).map(|t| t.id);
-
-        // Fall back to through-foliage / over-wall mortar suppression on recently tracked mechs
-        let combat_target = visible_target.clone().or_else(|| {
-            tactics::find_tracked_blind_target(obs, &self.cfg, &self.world, &self.belief)
-        });
-
-        let hp_frac = obs.me.hp / obs.me.max_hp.max(1.0);
-        let seek_heal = hp_frac < 0.48 && obs.me.in_zone;
-        let hold_regen = tactics::should_hold_regen(obs, los_enemies, self.belief.last_combat_t);
-        let ceasefire_for_regen = hp_frac < 0.80
-            && obs.me.in_zone
-            && los_enemies == 0
-            && (obs.t - self.belief.last_combat_t) >= 1.2;
-
-        let fallback_bearing = self.belief.best_unseen_bearing(obs.me.pos, obs.t);
-        let mut peek_point = None;
-        decide_combat(
-            obs,
-            &self.cfg,
-            &self.world,
-            self.belief.mode,
-            los_enemies,
-            ceasefire_for_regen,
-            urgent_dodge,
-            combat_target.as_ref(),
-            fallback_bearing,
-            self.last_aim,
-            &mut self.laser_last_los_t,
-            &mut peek_point,
-            &mut act,
-        );
-
-        self.decide_movement(
-            obs,
-            visible_target.as_ref(),
-            los_enemies,
-            seek_heal,
-            hold_regen,
-            peek_point,
-            dodge,
-            urgent_dodge,
-            &mut act,
-        );
-
-        act.sanitize(self.cfg.min_pitch, self.cfg.max_pitch);
-        self.last_aim = act.aim;
-        act
-    }
-
-    fn pick_upgrade(&self, offer: &Offer, obs: &ObsMsg) -> usize {
-        let held_slot = |k: &str| -> Option<&WeaponSlot> {
-            obs.me.weapons.iter().flatten().find(|w| w.kind == k)
+        // 2. Held weapon slots
+        let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
+            me.weapons
+                .iter()
+                .enumerate()
+                .take(2)
+                .find_map(|(i, s)| s.as_ref().filter(|w| w.kind == k).map(|w| (i, w)))
         };
-        let held_laser = held_slot("laser").is_some();
-        let held_lightning = held_slot("lightning").is_some();
-        let held_mortar = held_slot("mortar").is_some();
-        let is_ffa = self.belief.mode == MatchMode::FfaSurvival;
+        let gun_slot = find_slot("gun");
+        let laser_slot = find_slot("laser");
+        let light_slot = find_slot("lightning");
+        let mortar_slot = find_slot("mortar");
+        let only_gun = me.weapons.iter().take(2).any(|w| w.is_none());
 
-        let apply_effect = |mut val: f64, eff: &UpgradeEffect| -> f64 {
-            if let Some(m) = eff.mul {
-                val *= m;
-            }
-            if let Some(a) = eff.add {
-                val += a;
-            }
-            val
-        };
-
-        let score_choice = |c: &OfferChoice| -> f64 {
-            let Some(def) = self.cfg.upgrades.iter().find(|u| u.id == c.id) else {
-                let id = c.id.to_lowercase();
-                let desc = c.desc.to_lowercase();
-                let mut s = 30.0;
-                if id.contains("armor") || desc.contains("damage taken") {
-                    s += 120.0;
-                }
-                if id.contains("hp")
-                    || id.contains("plating")
-                    || desc.contains("max hp")
-                    || desc.contains("regen")
-                {
-                    s += 115.0;
-                }
-                if id.contains("lightning") && held_lightning {
-                    s += 110.0;
-                }
-                if id.contains("laser") && held_laser {
-                    s += 105.0;
-                }
-                if id.contains("mortar") && held_mortar {
-                    s += 85.0;
-                }
-                return s;
-            };
-
-            let base_hp = obs.me.stat_f64("hp", obs.me.max_hp.max(1400.0));
-            let base_armor = obs.me.stat_f64("armor", 0.0).clamp(0.0, 0.85);
-            let base_regen = obs.me.stat_f64("regen_per_s", 45.0).max(1.0);
-            let base_delay = obs.me.stat_f64("regen_delay", self.cfg.regen_delay).max(0.5);
-            let base_walk = obs.me.stat_f64("walk_speed", 11.7).max(1.0);
-            let base_boost = obs.me.stat_f64("boost_speed", 19.5).max(1.0);
-            let base_energy = obs.me.stat_f64("energy", obs.me.max_energy.max(100.0)).max(1.0);
-            let base_eregen = obs.me.stat_f64("energy_regen", 18.0).max(1.0);
-            let base_bdrain = obs.me.stat_f64("boost_drain", 17.0).max(1.0);
-            let base_jdrain = obs.me.stat_f64("jet_drain", 15.0).max(1.0);
-            let base_turn = obs.me.stat_f64("turn_rate", 4.0).max(0.1);
-            let base_pitch = obs.me.stat_f64("pitch_rate", 3.0).max(0.1);
-            let base_near = obs.me.stat_f64("near_range_bonus", 0.0);
-            let base_vis = obs.me.stat_f64("vision_bonus", 0.0);
-            let base_hear = obs.me.stat_f64("hearing", 1.0).max(0.05);
-
-            let mut new_hp = base_hp;
-            let mut new_armor = base_armor;
-            let mut new_regen = base_regen;
-            let mut new_delay = base_delay;
-            let mut new_walk = base_walk;
-            let mut new_boost = base_boost;
-            let mut new_energy = base_energy;
-            let mut new_eregen = base_eregen;
-            let mut new_bdrain = base_bdrain;
-            let mut new_jdrain = base_jdrain;
-            let mut new_turn = base_turn;
-            let mut new_pitch = base_pitch;
-            let mut new_near = base_near;
-            let mut new_vis = base_vis;
-            let mut new_hear = base_hear;
-
-            let mut s = 0.0;
-
-            for eff in &def.effects {
-                match eff.path.as_str() {
-                    "mech.hp" => new_hp = apply_effect(new_hp, eff),
-                    "mech.armor" => new_armor = apply_effect(new_armor, eff).clamp(0.0, 0.85),
-                    "mech.regen_per_s" => new_regen = apply_effect(new_regen, eff),
-                    "mech.regen_delay" => new_delay = apply_effect(new_delay, eff).max(0.5),
-                    "mech.walk_speed" => new_walk = apply_effect(new_walk, eff),
-                    "mech.boost_speed" => new_boost = apply_effect(new_boost, eff),
-                    "mech.energy" => new_energy = apply_effect(new_energy, eff),
-                    "mech.energy_regen" => new_eregen = apply_effect(new_eregen, eff),
-                    "mech.boost_drain" => new_bdrain = apply_effect(new_bdrain, eff).max(0.5),
-                    "mech.jet_drain" => new_jdrain = apply_effect(new_jdrain, eff).max(0.5),
-                    "mech.turn_rate" => new_turn = apply_effect(new_turn, eff),
-                    "mech.pitch_rate" => new_pitch = apply_effect(new_pitch, eff),
-                    "mech.near_range_bonus" => new_near = apply_effect(new_near, eff),
-                    "mech.vision_bonus" => new_vis = apply_effect(new_vis, eff),
-                    "mech.hearing" => new_hear = apply_effect(new_hear, eff).max(0.05),
-                    _ => {}
-                }
-            }
-
-            // 1. EHP & armor regen-amplification delta
-            let cur_ehp = base_hp / (1.0 - base_armor).max(0.15);
-            let new_ehp = new_hp / (1.0 - new_armor).max(0.15);
-            let ehp_rel = (new_ehp - cur_ehp) / cur_ehp;
-            let armor_rel = (1.0 - base_armor) / (1.0 - new_armor).max(0.15) - 1.0;
-            s += ehp_rel * 860.0 + armor_rel * 550.0;
-
-            // 2. Out-of-combat regen delta
-            let regen_rel = (new_regen - base_regen) / base_regen;
-            let delay_red = (base_delay - new_delay).max(0.0) / base_delay;
-            s += regen_rel * 130.0 + delay_red * 145.0;
-
-            // 3. Mobility, energy & torso slew
-            s += ((new_walk - base_walk) / base_walk) * 620.0;
-            s += ((new_boost - base_boost) / base_boost) * 480.0;
-            s += ((new_energy - base_energy) / base_energy)
-                * if held_lightning { 270.0 } else { 210.0 };
-            s += ((new_eregen - base_eregen) / base_eregen)
-                * if held_lightning { 310.0 } else { 240.0 };
-            s += ((base_bdrain - new_bdrain) / base_bdrain) * 190.0;
-            s += ((base_jdrain - new_jdrain) / base_jdrain) * 120.0;
-            s += ((new_turn - base_turn) / base_turn) * 150.0;
-            s += ((new_pitch - base_pitch) / base_pitch) * 80.0;
-
-            // 4. Perception / sensors
-            let sensor_mult = if is_ffa { 1.45 } else { 0.85 };
-            s += ((new_near - base_near) * 2.8
-                + (new_vis - base_vis) * 1.1
-                + ((base_hear - new_hear) / base_hear) * 35.0)
-                * sensor_mult;
-
-            // 5. Weapon DPS & utility deltas against live weapon slot stats
-            if let Some(w) = held_slot("lightning") {
-                let b_dmg = w.stat_f64("damage", 60.0);
-                let b_cd = w.stat_f64("cooldown", 0.25).max(0.05);
-                let b_rng = w.stat_f64("range", 45.0).max(1.0);
-                let b_cone = w.stat_f64("cone_deg", 30.0).max(1.0);
-                let b_eng = w.stat_f64("energy", 3.0).max(0.1);
-                let b_chain = w.stat_f64("chain", 2.0);
-                let (mut a_dmg, mut a_cd, mut a_rng, mut a_cone, mut a_eng, mut a_chain) =
-                    (b_dmg, b_cd, b_rng, b_cone, b_eng, b_chain);
-                for eff in &def.effects {
-                    match eff.path.as_str() {
-                        "weapons.lightning.damage" => a_dmg = apply_effect(a_dmg, eff),
-                        "weapons.lightning.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
-                        "weapons.lightning.range" => a_rng = apply_effect(a_rng, eff),
-                        "weapons.lightning.cone_deg" => a_cone = apply_effect(a_cone, eff),
-                        "weapons.lightning.energy" => a_eng = apply_effect(a_eng, eff).max(0.1),
-                        "weapons.lightning.chain" => a_chain = apply_effect(a_chain, eff),
-                        _ => {}
-                    }
-                }
-                let dps_rel = ((a_dmg / a_cd) - (b_dmg / b_cd)) / (b_dmg / b_cd);
-                s += dps_rel * 480.0
-                    + ((a_rng - b_rng) / b_rng) * 520.0
-                    + ((a_cone - b_cone) / b_cone) * 130.0
-                    + ((b_eng - a_eng) / b_eng) * 210.0
-                    + (a_chain - b_chain) * if is_ffa { 42.0 } else { 92.0 };
-            }
-
-            if let Some(w) = held_slot("laser") {
-                let b_dmg = w.stat_f64("damage", 315.0);
-                let b_chg = w.stat_f64("charge", 0.75).max(0.05);
-                let b_cd = w.stat_f64("cooldown", 1.65).max(0.05);
-                let b_pierce = w.stat_f64("pierce", 0.0);
-                let (mut a_dmg, mut a_chg, mut a_cd, mut a_pierce) =
-                    (b_dmg, b_chg, b_cd, b_pierce);
-                for eff in &def.effects {
-                    match eff.path.as_str() {
-                        "weapons.laser.damage" => a_dmg = apply_effect(a_dmg, eff),
-                        "weapons.laser.charge" => a_chg = apply_effect(a_chg, eff).max(0.05),
-                        "weapons.laser.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
-                        "weapons.laser.pierce" => a_pierce = apply_effect(a_pierce, eff),
-                        _ => {}
-                    }
-                }
-                let dps_b = b_dmg / (b_chg + b_cd);
-                let dps_a = a_dmg / (a_chg + a_cd);
-                s += ((dps_a - dps_b) / dps_b) * 640.0
-                    + ((b_chg - a_chg) / b_chg) * 260.0
-                    + (a_pierce - b_pierce) * if is_ffa { 55.0 } else { 85.0 };
-            }
-
-            if let Some(w) = held_slot("mortar") {
-                let b_dmg = w.stat_f64("damage", 200.0);
-                let b_spl = w.stat_f64("splash", 160.0);
-                let b_cd = w.stat_f64("cooldown", 2.6).max(0.1);
-                let b_rad = w.stat_f64("splash_radius", 7.0).max(1.0);
-                let b_spd = w.stat_f64("speed", self.cfg.mortar_speed).max(1.0);
-                let (mut a_dmg, mut a_spl, mut a_cd, mut a_rad, mut a_spd) =
-                    (b_dmg, b_spl, b_cd, b_rad, b_spd);
-                for eff in &def.effects {
-                    match eff.path.as_str() {
-                        "weapons.mortar.damage" => a_dmg = apply_effect(a_dmg, eff),
-                        "weapons.mortar.splash" => a_spl = apply_effect(a_spl, eff),
-                        "weapons.mortar.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.1),
-                        "weapons.mortar.splash_radius" => a_rad = apply_effect(a_rad, eff),
-                        "weapons.mortar.speed" => a_spd = apply_effect(a_spd, eff),
-                        _ => {}
-                    }
-                }
-                let dps_b = (b_dmg + 0.5 * b_spl) / b_cd;
-                let dps_a = (a_dmg + 0.5 * a_spl) / a_cd;
-                s += ((dps_a - dps_b) / dps_b) * 460.0
-                    + ((a_rad - b_rad) / b_rad) * 300.0
-                    + ((a_spd - b_spd) / b_spd) * 380.0;
-            }
-
-            if let Some(w) = held_slot("gun") {
-                let b_dmg = w.stat_f64("damage", 45.0);
-                let b_cd = w.stat_f64("cooldown", 0.24).max(0.05);
-                let b_mag = w.stat_f64("mag", 12.0).max(1.0);
-                let b_rel = w.stat_f64("reload", 2.4).max(0.1);
-                let b_spd = w.stat_f64("speed", 252.0).max(1.0);
-                let b_rng = w.stat_f64("range", 230.0).max(1.0);
-                let (mut a_dmg, mut a_cd, mut a_mag, mut a_rel, mut a_spd, mut a_rng) =
-                    (b_dmg, b_cd, b_mag, b_rel, b_spd, b_rng);
-                for eff in &def.effects {
-                    match eff.path.as_str() {
-                        "weapons.gun.damage" => a_dmg = apply_effect(a_dmg, eff),
-                        "weapons.gun.cooldown" => a_cd = apply_effect(a_cd, eff).max(0.05),
-                        "weapons.gun.mag" => a_mag = apply_effect(a_mag, eff).max(1.0),
-                        "weapons.gun.reload" => a_rel = apply_effect(a_rel, eff).max(0.1),
-                        "weapons.gun.speed" => a_spd = apply_effect(a_spd, eff),
-                        "weapons.gun.range" => a_rng = apply_effect(a_rng, eff),
-                        _ => {}
-                    }
-                }
-                let burst_b = b_dmg / b_cd;
-                let burst_a = a_dmg / a_cd;
-                let sust_b = (b_mag * b_dmg) / (b_mag * b_cd + b_rel);
-                let sust_a = (a_mag * a_dmg) / (a_mag * a_cd + a_rel);
-                let dps_rel =
-                    0.55 * ((burst_a - burst_b) / burst_b) + 0.45 * ((sust_a - sust_b) / sust_b);
-                let gun_mult = if held_lightning || held_laser { 0.42 } else { 0.72 };
-                s += (dps_rel * 580.0
-                    + ((a_spd - b_spd) / b_spd) * 240.0
-                    + ((a_rng - b_rng) / b_rng) * 100.0)
-                    * gun_mult;
-            }
-
-            s
-        };
-
-        offer
-            .choices
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| score_choice(a).total_cmp(&score_choice(b)))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
-
-    fn weapon_priority(&self, kind: &str, obs: &ObsMsg) -> i32 {
-        match kind {
-            "lightning" => 115,
-            "laser" => 97,
-            "mortar" => {
-                if obs.zone.dps >= 100.0 || obs.zone.radius <= 140.0 {
-                    98
-                } else {
-                    84
-                }
-            }
-            "gun" => 60,
-            _ => 0,
-        }
-    }
-
-    fn valid_loadout_pair(a: &str, b: &str) -> bool {
-        if a == b {
-            return false;
-        }
-        a == "gun" || b == "gun"
-    }
-
-    fn handle_weapon_pickup(&self, obs: &ObsMsg, los_enemies: usize, act: &mut Action) {
-        let held: Vec<Option<&str>> = obs
-            .me
-            .weapons
-            .iter()
-            .map(|w| w.as_ref().map(|s| s.kind.as_str()))
-            .collect();
-        let has_kind = |k: &str| held.iter().any(|w| *w == Some(k));
-        let empty_slot = held.iter().position(|w| w.is_none());
-
-        let mut best: Option<(i32, u64, Option<usize>)> = None;
-        for p in &obs.pickups {
-            let dh = dist_2d(obs.me.pos, p.pos);
-            let dz = (obs.me.pos[2] - p.pos[2]).abs();
-            if dh > self.cfg.pickup_radius || dz > 4.0 || has_kind(&p.kind) {
+        // 3. Nearest wanted pickup & cube from persistent memory
+        let mut near_pick: Option<[f64; 3]> = None;
+        let mut near_pick_d = f64::INFINITY;
+        for p in self.belief.pick_mem.values() {
+            if self.want_kind(obs, &p.kind).is_none() {
                 continue;
             }
-            let new_prio = self.weapon_priority(&p.kind, obs);
-            if empty_slot.is_some() {
-                if new_prio > 0 && best.map_or(true, |b| new_prio > b.0) {
-                    best = Some((new_prio, p.id, None));
-                }
-            } else if los_enemies == 0 {
-                // Never trigger a 1.0–1.65 s equip lockout swap while under LOS fire
-                for (slot_idx, slot) in obs.me.weapons.iter().enumerate().take(2) {
-                    let Some(w) = slot else { continue };
-                    if w.kind == "laser" && w.charge > 0.0 {
-                        continue;
-                    }
-                    let other_kind = obs
-                        .me
-                        .weapons
-                        .get(1 - slot_idx)
-                        .and_then(|s| s.as_ref())
-                        .map(|s| s.kind.as_str())
-                        .unwrap_or("");
-                    if !other_kind.is_empty() && !Self::valid_loadout_pair(&p.kind, other_kind) {
-                        continue;
-                    }
-                    let cur_prio = self.weapon_priority(&w.kind, obs);
-                    if new_prio > cur_prio + 10 && best.map_or(true, |b| new_prio > b.0) {
-                        best = Some((new_prio, p.id, Some(slot_idx)));
-                    }
-                }
+            let d = (p.pos[0] - x).hypot(p.pos[1] - y)
+                - if only_gun { 0.0 } else { weapon_pref(&p.kind) * 5.0 };
+            if d < near_pick_d {
+                near_pick_d = d;
+                near_pick = Some(p.pos);
             }
         }
 
-        if let Some((_, pid, drop_slot)) = best {
-            act.take = Some(pid);
-            act.drop = drop_slot;
-        }
-    }
-
-    fn is_in_safe_next_zone(&self, x: f64, y: f64, obs: &ObsMsg, margin: f64) -> bool {
-        let d = ((x - obs.zone.next_center[0]).powi(2) + (y - obs.zone.next_center[1]).powi(2))
-            .sqrt();
-        d <= (obs.zone.next_radius - margin).max(4.0)
-    }
-
-    fn choose_macro_goal(
-        &mut self,
-        obs: &ObsMsg,
-        target: Option<&TargetInfo>,
-        visible_threat_eyes: &[[f64; 3]],
-        los_enemies: usize,
-        seek_heal: bool,
-        hold_regen: bool,
-    ) -> [f64; 3] {
-        let pos = obs.me.pos;
-        let next_z = [
-            obs.zone.next_center[0],
-            obs.zone.next_center[1],
-            self.world
-                .terrain_height(obs.zone.next_center[0], obs.zone.next_center[1]),
-        ];
-
-        // 1. Zone rotation
-        let dist_next = dist_2d(pos, next_z);
-        let time_to_shrink = (obs.zone.shrink_start - obs.t).max(0.0);
-        let must_rotate = !obs.me.in_zone
-            || (dist_next > (obs.zone.next_radius - 16.0).max(5.0)
-                && (time_to_shrink < 16.0 || obs.zone.dps >= 60.0));
-        if must_rotate {
-            return next_z;
-        }
-
-        // 2. Ground-only building-corner escape ONLY when critically low HP (<48%) under LOS fire
-        if seek_heal && los_enemies > 0 && !visible_threat_eyes.is_empty() {
-            let safe_z_r = (obs.zone.radius - 5.0).max(5.0);
-            let world = &self.world;
-            let eye_off = obs.me.eye_height();
-            let cover_los = |pt: [f64; 3]| -> usize {
-                let pt_eye = [pt[0], pt[1], pt[2] + eye_off];
-                visible_threat_eyes
-                    .iter()
-                    .filter(|&&te| world.raycast_solid(te, pt_eye).is_none())
-                    .count()
-            };
-
-            let reuse = self.escape_cache.filter(|&(pt, tick, orig_los)| {
-                if obs.tick.saturating_sub(tick) >= 6 || dist_2d(pos, pt) <= 6.0 {
-                    return false;
-                }
-                let d_zone = ((pt[0] - obs.zone.center[0]).powi(2)
-                    + (pt[1] - obs.zone.center[1]).powi(2))
-                .sqrt();
-                d_zone <= safe_z_r && cover_los(pt) <= orig_los
-            });
-            if let Some((pt, _, _)) = reuse {
-                return pt;
-            }
-            self.escape_cache = None;
-            let esc_dir = self.belief.escape_vector(pos, obs.t);
-            if let Some(cover_pt) = self.nav.find_escape_cover(
-                pos,
-                eye_off,
-                visible_threat_eyes,
-                esc_dir,
-                true,
-                false, // Never jet-climb mid-combat
-                &self.world,
-                obs.zone.center,
-                obs.zone.radius,
-                obs.zone.next_center,
-                obs.zone.next_radius,
-            ) {
-                let los_now = cover_los(cover_pt);
-                self.escape_cache = Some((cover_pt, obs.tick, los_now));
-                return cover_pt;
-            }
-        } else {
-            self.escape_cache = None;
-        }
-
-        // 3. Ground-level high-value weapon pickups (lightning / laser / mortar into empty slot)
-        let next_hits_upgrade = self.cfg.upgrade_thresholds.contains(&(obs.me.cubes + 1));
-        let empty_slot = obs.me.weapons.iter().any(|w| w.is_none());
-        let best_pickup = obs
-            .pickups
-            .iter()
-            .filter(|p| {
-                if !empty_slot && los_enemies > 0 {
-                    return false;
-                }
-                let already_have = obs
-                    .me
-                    .weapons
-                    .iter()
-                    .any(|w| w.as_ref().map_or(false, |s| s.kind == p.kind));
-                if already_have
-                    || (p.pos[2] - pos[2]) > self.cfg.step_up + 1.5
-                    || !self.is_in_safe_next_zone(p.pos[0], p.pos[1], obs, 6.0)
-                {
-                    return false;
-                }
-                let prio = self.weapon_priority(&p.kind, obs);
-                if empty_slot {
-                    prio >= 80
-                } else {
-                    obs.me.weapons.iter().enumerate().take(2).any(|(idx, slot)| {
-                        let Some(w) = slot else { return false };
-                        let other_kind = obs
-                            .me
-                            .weapons
-                            .get(1 - idx)
-                            .and_then(|s| s.as_ref())
-                            .map(|s| s.kind.as_str())
-                            .unwrap_or("");
-                        let pair_ok =
-                            other_kind.is_empty() || Self::valid_loadout_pair(&p.kind, other_kind);
-                        pair_ok && prio > self.weapon_priority(&w.kind, obs) + 12
-                    })
-                }
-            })
-            .min_by(|a, b| {
-                let sa = dist_2d(pos, a.pos) - self.weapon_priority(&a.kind, obs) as f64 * 0.6;
-                let sb = dist_2d(pos, b.pos) - self.weapon_priority(&b.kind, obs) as f64 * 0.6;
-                sa.total_cmp(&sb)
-            });
-
-        if let Some(p) = best_pickup {
-            let max_r = if empty_slot || next_hits_upgrade { 95.0 } else { 55.0 };
-            if dist_2d(pos, p.pos) < max_r {
-                return p.pos;
-            }
-        }
-
-        // 4. Supply drops (exact Iter 8 logic: skip only if contested by >=2 LOS mechs)
-        let near_mechs = obs
+        // Immediate weapon pickup (avoid mid-brawl full-slot lockout when an enemy is close)
+        let close_mech_threat = obs
             .mechs
             .iter()
-            .filter(|m| m.kind == "mech" && dist_2d(pos, m.pos) < 50.0)
-            .count();
-        for d in &obs.drops {
-            let dist = dist_2d(pos, d.pos);
-            if d.lands_in <= 14.0 && dist < 140.0 && los_enemies <= 1 {
-                if self.belief.mode != MatchMode::FfaSurvival || near_mechs == 0 {
-                    return d.pos;
-                } else if dist > 45.0 {
-                    let ux = (pos[0] - d.pos[0]) / dist.max(1.0);
-                    let uy = (pos[1] - d.pos[1]) / dist.max(1.0);
-                    return [d.pos[0] + ux * 42.0, d.pos[1] + uy * 42.0, d.pos[2]];
-                }
+            .any(|m| m.kind == "mech" && (m.pos[0] - x).hypot(m.pos[1] - y) < 55.0);
+        let reach = (self.cfg.pickup_radius - 0.3).max(2.0);
+        for p in &obs.pickups {
+            if (p.pos[0] - x).hypot(p.pos[1] - y) > reach || (p.pos[2] - z).abs() > 3.5 {
+                continue;
             }
-        }
-
-        // 5. Fast 10-cube snowball: loose cubes > NPCs (2 cubes) > ground crates
-        let next_threshold_close = self
-            .cfg
-            .upgrade_thresholds
-            .iter()
-            .copied()
-            .find(|&th| th > obs.me.cubes)
-            .map_or(false, |th| th - obs.me.cubes <= 2 && th <= 21);
-        let want_cubes = obs.me.cubes < self.cfg.cube_stat_cap || next_threshold_close;
-        if want_cubes {
-            if let Some(c) = obs
-                .cubes
-                .iter()
-                .filter(|c| {
-                    (c.pos[2] - pos[2]) <= self.cfg.step_up + 1.5
-                        && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 5.0)
-                })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
-            {
-                if dist_2d(pos, c.pos) < 85.0 {
-                    return c.pos;
-                }
-            }
-            if let Some(npc) = obs
-                .mechs
-                .iter()
-                .filter(|m| {
-                    m.kind == "npc"
-                        && self.is_in_safe_next_zone(m.pos[0], m.pos[1], obs, 10.0)
-                        && dist_2d(pos, m.pos) < 80.0
-                })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
-            {
-                return npc.pos;
-            }
-            if let Some(cr) = obs
-                .crates
-                .iter()
-                .filter(|c| {
-                    (c.pos[2] - pos[2]) <= self.cfg.step_up + 1.5
-                        && self.is_in_safe_next_zone(c.pos[0], c.pos[1], obs, 8.0)
-                })
-                .min_by(|a, b| dist_2d(pos, a.pos).total_cmp(&dist_2d(pos, b.pos)))
-            {
-                if dist_2d(pos, cr.pos) < 75.0 {
-                    return cr.pos;
-                }
-            }
-        }
-
-        // 6. Mode-specific mid/late objective (skip blind hunting while actively finishing regen)
-        if self.belief.mode == MatchMode::PracticeHivemind
-            && obs.me.hp / obs.me.max_hp.max(1.0) > 0.62
-            && !hold_regen
-        {
-            if let Some(t) = target {
-                if t.is_mech {
-                    return t.pos;
-                }
-            }
-            if let Some(hunt) = self.belief.nearest_hunt_point(pos, obs.t) {
-                return hunt;
-            }
-        } else if self.belief.mode == MatchMode::FfaSurvival && near_mechs == 0 {
-            if let Some(roof) = self.nav.find_safe_rooftop(
-                pos,
-                obs.zone.next_center,
-                obs.zone.next_radius,
-                100.0,
-            ) {
-                return roof;
-            }
-        }
-
-        // 7. Anchor near a building edge inside next_zone instead of the open Oval center
-        if let Some(anchor) = self.nav.find_cover_anchor(
-            pos,
-            obs.zone.next_center,
-            obs.zone.next_radius,
-            90.0,
-        ) {
-            return anchor;
-        }
-
-        next_z
-    }
-
-    fn decide_movement(
-        &mut self,
-        obs: &ObsMsg,
-        target: Option<&TargetInfo>,
-        los_enemies: usize,
-        seek_heal: bool,
-        hold_regen: bool,
-        peek_point: Option<[f64; 3]>,
-        dodge: [f64; 2],
-        urgent_dodge: bool,
-        act: &mut Action,
-    ) {
-        let pos = obs.me.pos;
-        let radius = obs.me.radius();
-        let height = obs.me.height();
-        let my_eye_off = obs.me.eye_height();
-        let on_roof = pos[2] > self.world.terrain_height(pos[0], pos[1]) + 2.5;
-
-        let find_w = |k: &str| obs.me.weapons.iter().flatten().find(|w| w.kind == k);
-        let lightning_w = find_w("lightning");
-        let laser_w = find_w("laser");
-        let mortar_w = find_w("mortar");
-        let gun_w = find_w("gun");
-
-        let has_lightning = lightning_w.is_some();
-        let lightning_range = lightning_w.map_or(45.0, |w| w.stat_f64("range", 45.0));
-        let has_laser = laser_w.is_some();
-        let laser_charging = laser_w.map_or(false, |w| w.charge > 0.0);
-
-        // Strictly currently-visible enemy mechs within 155 m (top 4 closest) for combat steering
-        let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
-            .mechs
-            .iter()
-            .filter(|m| m.kind == "mech")
-            .map(|m| {
-                let d2 = (m.pos[0] - pos[0]).powi(2) + (m.pos[1] - pos[1]).powi(2);
-                let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * m.cubes as f64);
-                (d2, [m.pos[0], m.pos[1], m.pos[2] + 0.78 * h])
-            })
-            .filter(|(d2, _)| *d2 <= 155.0 * 155.0)
-            .collect();
-        vis_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
-        vis_enemies.truncate(4);
-        let visible_threat_eyes: Vec<[f64; 3]> = vis_enemies.into_iter().map(|(_, p)| p).collect();
-
-        let strafe_period = if !visible_threat_eyes.is_empty() { 8 } else { 18 };
-        if obs.tick.saturating_sub(self.last_strafe_flip) >= strafe_period {
-            self.strafe_sign = -self.strafe_sign;
-            self.last_strafe_flip = obs.tick;
-        }
-
-        let goal = self.choose_macro_goal(
-            obs,
-            target,
-            &visible_threat_eyes,
-            los_enemies,
-            seek_heal,
-            hold_regen,
-        );
-        let allow_jet = self.belief.mode == MatchMode::FfaSurvival
-            && los_enemies == 0
-            && obs.me.energy >= 65.0
-            && !urgent_dodge;
-        let wp = self.nav.next_waypoint(obs.tick, pos, goal, allow_jet);
-
-        let climbing = allow_jet
-            && wp.z > pos[2] + self.cfg.step_up + 0.4
-            && ((wp.x - pos[0]).powi(2) + (wp.y - pos[1]).powi(2)).sqrt() < 9.5;
-        if climbing {
-            if obs.me.grounded {
-                act.jump = true;
-            }
-            act.boost = true;
-            if !obs.me.grounded && obs.me.vel[2] < 1.2 {
-                self.climb_stuck_ticks += 1;
-            } else {
-                self.climb_stuck_ticks = 0;
-            }
-            let mut dx = wp.x - pos[0];
-            let mut dy = wp.y - pos[1];
-            if self.climb_stuck_ticks >= 2 && self.climb_stuck_ticks <= 5 {
-                dx = -dx;
-                dy = -dy;
-            } else if pos[2] < wp.z + 0.25 {
-                dx *= 0.35;
-                dy *= 0.35;
-            }
-            let l = (dx * dx + dy * dy).sqrt().max(1e-4);
-            act.move_dir = [dx / l, dy / l];
-            return;
-        }
-        self.climb_stuck_ticks = 0;
-
-        let nav_dx = wp.x - pos[0];
-        let nav_dy = wp.y - pos[1];
-        let nav_len = (nav_dx * nav_dx + nav_dy * nav_dy).sqrt();
-        let nav_u = if nav_len > 0.5 {
-            [nav_dx / nav_len, nav_dy / nav_len]
-        } else {
-            [0.0, 0.0]
-        };
-
-        let dodge_len = (dodge[0] * dodge[0] + dodge[1] * dodge[1]).sqrt();
-        let dodge_u = if dodge_len > 0.05 {
-            [dodge[0] / dodge_len, dodge[1] / dodge_len]
-        } else {
-            [0.0, 0.0]
-        };
-
-        let in_combat = !visible_threat_eyes.is_empty();
-        let primary_mech = target.filter(|t| t.is_mech);
-        let escape_dir = self.belief.escape_vector(pos, obs.t);
-
-        let laser_threats = tactics::active_laser_threats(obs, &self.cfg, &self.world);
-        let secondary_eyes = if !seek_heal && los_enemies == 1 {
-            primary_mech
-                .map(|pm| tactics::secondary_threat_eyes(obs, &self.cfg, &self.belief, pm.id))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Corner peek-out unit vector when pre-charging laser behind cover
-        let peek_u = peek_point.and_then(|pk| {
-            let dx = pk[0] - pos[0];
-            let dy = pk[1] - pos[1];
-            let len = (dx * dx + dy * dy).sqrt();
-            if len > 0.5 { Some([dx / len, dy / len]) } else { None }
-        });
-
-        // Duck briefly behind cover during zero-DPS burst cooldowns
-        let lightning_active = lightning_w.map_or(false, |w| {
-            let e_cost = w.stat_f64("energy", 3.0);
-            let e_min = if gun_w.is_none() {
-                e_cost + 0.05
-            } else {
-                7.0_f64.max(e_cost + 0.05)
+            let Some(swap_slot) = self.want_kind(obs, &p.kind) else {
+                continue;
             };
-            obs.me.energy >= e_min
-                && primary_mech.map_or(false, |pm| pm.los && pm.dist <= lightning_range + 4.0)
-        });
-        let gun_active = gun_w.map_or(false, |w| w.reload <= 0.25 && w.ammo.unwrap_or(1) > 0);
-        let burst_on_cd = laser_w.map_or(false, |w| w.cooldown > 0.35 && w.charge <= 0.0)
-            || mortar_w.map_or(false, |w| w.cooldown > 0.5);
-        let duck_on_cooldown = !laser_charging
-            && los_enemies >= 1
-            && burst_on_cd
-            && !lightning_active
-            && !gun_active
-            && !seek_heal;
-
-        // Stay at the edge of live lightning range for max bullet-dodging space;
-        // only hold laser distance against mortar bots if we actually carry a laser
-        let ideal_dist = if let Some(pm) = primary_mech {
-            if seek_heal || los_enemies >= 2 {
-                90.0
-            } else if has_lightning
-                && obs.me.energy >= 20.0
-                && (!pm.has_mortar || !has_laser || pm.dist <= lightning_range + 3.0)
-            {
-                (lightning_range - 8.0).max(20.0)
-            } else if pm.has_lightning && !has_lightning {
-                68.0
-            } else if has_laser {
-                74.0
-            } else {
-                56.0
+            if swap_slot.is_some() && close_mech_threat && p.kind != "laser" {
+                continue;
             }
+            act.take = Some(p.id);
+            act.drop = swap_slot;
+            break;
+        }
+
+        let mut near_cube: Option<[f64; 3]> = None;
+        let mut near_cube_d = f64::INFINITY;
+        for c in self.belief.cube_mem.values() {
+            let d = (c.pos[0] - x).hypot(c.pos[1] - y);
+            if d < near_cube_d {
+                near_cube_d = d;
+                near_cube = Some(c.pos);
+            }
+        }
+
+        // 4. Select primary enemy mech target (age <= 4 s, focus fire + attacker priority)
+        let is_ffa = self.belief.mode == MatchMode::FfaSurvival;
+        let mut target: Option<TrackedMech> = None;
+        let mut best_t_score = f64::INFINITY;
+        for tr in self.belief.tracks.values() {
+            let age = t - tr.t;
+            if age > 4.0 {
+                continue;
+            }
+            let d = (tr.pos[0] - x).hypot(tr.pos[1] - y);
+            let hit_us = self
+                .belief
+                .attackers
+                .get(&tr.id)
+                .map_or(false, |&ht| t - ht < 3.0);
+            if is_ffa && obs.alive > 5 && d > 105.0 && tr.hp > 1000.0 && !hit_us {
+                continue;
+            }
+            let t_scale = 1.0 + self.cfg.cube_size_per_cube * tr.cubes as f64;
+            let tcz = tr.pos[2] + 4.5 * t_scale;
+            let has_los = self.world.raycast_solid(muzzle, [tr.pos[0], tr.pos[1], tcz]).is_none();
+            let hit_bonus = if hit_us { 50.0 } else { 0.0 };
+            let stick_bonus = if self.target_id == Some(tr.id) && t - self.target_t < 2.0 {
+                40.0
+            } else {
+                0.0
+            };
+            let los_bonus = if has_los { 25.0 } else { 0.0 };
+            let s = d + (tr.hp / 1400.0) * 90.0 + age * 30.0 - hit_bonus - stick_bonus - los_bonus;
+            if s < best_t_score {
+                best_t_score = s;
+                target = Some(tr.clone());
+            }
+        }
+        if let Some(tr) = &target {
+            self.target_id = Some(tr.id);
+            self.target_t = t;
+        }
+
+        // Count active nearby threats & collect their eye positions for cover checks
+        let mut threats = 0_usize;
+        let mut active_threat_eyes: Vec<[f64; 3]> = Vec::with_capacity(6);
+        for tr in self.belief.tracks.values() {
+            if t - tr.t < 3.0 && (tr.pos[0] - x).hypot(tr.pos[1] - y) < 160.0 {
+                threats += 1;
+                let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * tr.cubes as f64);
+                active_threat_eyes.push([tr.pos[0], tr.pos[1], tr.pos[2] + 0.78 * h]);
+            }
+        }
+
+        // 5. Zone rotation goal (near-edge, travel-time triggered)
+        let zn = &obs.zone;
+        let shrinking = t >= zn.shrink_start;
+        let time_to_shrink = zn.shrink_start - t;
+        let d_next = (x - zn.next_center[0]).hypot(y - zn.next_center[1]);
+        let d_cur = (x - zn.center[0]).hypot(y - zn.center[1]);
+        let walk_speed = me.walk_speed().max(1.0);
+        let need_next = d_next > zn.next_radius * 0.8
+            && (shrinking
+                || time_to_shrink < (d_next - zn.next_radius * 0.6) / walk_speed + 12.0);
+        let zone_goal: Option<[f64; 2]> = if !me.in_zone || d_cur > zn.radius * 0.9 || need_next {
+            let ang = (y - zn.next_center[1]).atan2(x - zn.next_center[0]);
+            let r = zn.next_radius * 0.45;
+            Some([
+                zn.next_center[0] + ang.cos() * r,
+                zn.next_center[1] + ang.sin() * r,
+            ])
         } else {
-            56.0
+            None
         };
 
-        let mut best_yaw = nav_dy.atan2(nav_dx);
-        let mut best_score = f64::NEG_INFINITY;
+        // 6. Combat & macro decision
+        let mut move_goal: Option<[f64; 2]> = None;
+        let mut aim_yaw = me.aim[0];
+        let mut aim_pitch = 0.0_f64;
+        let mut want_aim = false;
+        let mut in_fight = false;
+        let mut navigating = false;
+        let mut boost = false;
+        let mut jump = false;
+        let mut slow = false;
+        let hp_frac = me.hp / me.max_hp.max(1.0);
+        let laser_charging = laser_slot.map_or(false, |(_, w)| w.charge > 0.0);
 
-        for k in 0..16 {
-            let yaw = (k as f64) * (2.0 * PI / 16.0);
-            let ux = yaw.cos();
-            let uy = yaw.sin();
+        if let Some(tr) = &target {
+            in_fight = true;
+            let tp = tr.pos;
+            let d = (tp[0] - x).hypot(tp[1] - y);
+            let t_scale = 1.0 + self.cfg.cube_size_per_cube * tr.cubes as f64;
+            let tcz = tp[2] + 4.5 * t_scale;
+            let t_center = [tp[0], tp[1], tcz];
+            let age = (t - tr.t).max(0.0);
+            let seen = age < 0.11;
+            let has_los = self.world.raycast_solid(muzzle, t_center).is_none();
 
-            let ok_near = self.world.is_walkable_step(
-                pos,
-                pos[0] + ux * 3.2,
-                pos[1] + uy * 3.2,
-                radius + 0.2,
-                height,
-                self.cfg.step_up,
-                self.cfg.max_slope_deg,
-            );
-            let ok_far = ok_near
-                && self.world.is_walkable_step(
-                    pos,
-                    pos[0] + ux * 7.0,
-                    pos[1] + uy * 7.0,
-                    radius + 0.2,
-                    height,
-                    self.cfg.step_up,
-                    self.cfg.max_slope_deg,
-                );
+            let instant_aim = aim_to(muzzle, t_center);
+            let gun_speed = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
+            let gun_lead = lead_aim(muzzle, t_center, tr.vel, age, gun_speed, &self.world);
 
-            let mut score = if ok_far {
-                35.0
-            } else if ok_near {
-                8.0
-            } else {
-                -180.0
-            };
-
-            let lx = pos[0] + ux * 10.0;
-            let ly = pos[1] + uy * 10.0;
-            let d_cur_z = ((lx - obs.zone.center[0]).powi(2) + (ly - obs.zone.center[1]).powi(2))
-                .sqrt();
-            if d_cur_z > obs.zone.radius - 4.0 {
-                score -= 220.0;
-            } else if !obs.me.in_zone {
-                let d_next_z = ((lx - obs.zone.next_center[0]).powi(2)
-                    + (ly - obs.zone.next_center[1]).powi(2))
-                .sqrt();
-                score -= d_next_z * 2.5;
-            }
-
-            if dodge_len > 0.05 {
-                score += (ux * dodge_u[0] + uy * dodge_u[1])
-                    * if urgent_dodge { 155.0 } else { 78.0 };
-            }
-
-            if let Some(pu) = peek_u {
-                score += (ux * pu[0] + uy * pu[1]) * 95.0;
-            }
-
-            let nav_dot = ux * nav_u[0] + uy * nav_u[1];
-            let nav_weight = if !obs.me.in_zone {
-                95.0
-            } else if seek_heal && self.escape_cache.is_some() {
-                48.0
-            } else if in_combat {
-                22.0
-            } else {
-                68.0
-            };
-            score += nav_dot * nav_weight;
-
-            if (in_combat || !laser_threats.is_empty()) && ok_near {
-                let cand_z = if on_roof {
-                    pos[2]
-                } else {
-                    self.world.terrain_height(lx, ly)
-                };
-                let cand_eye = [lx, ly, cand_z + my_eye_off];
-
-                // Step behind solid geometry to blank incoming enemy laser charges
-                if !laser_threats.is_empty() {
-                    let blanked = laser_threats
-                        .iter()
-                        .filter(|&&lm| self.world.raycast_solid(lm, cand_eye).is_some())
-                        .count();
-                    if blanked > 0 {
-                        score += (blanked as f64) * 110.0;
-                    }
-                }
-
-                if in_combat {
-                    let mut future_los = 0_usize;
-                    for &te in &visible_threat_eyes {
-                        if self.world.raycast_solid(te, cand_eye).is_none() {
-                            future_los += 1;
-                        }
-                    }
-
-                    if seek_heal || los_enemies >= 2 {
-                        score += (ux * escape_dir[0] + uy * escape_dir[1]) * 26.0;
-                        if future_los == 0 {
-                            score += if seek_heal { 130.0 } else { 72.0 };
-                        } else if future_los == 1 && !seek_heal {
-                            score += 110.0;
+            // Weapon aim priority (with twin-arm Lightning + Gun dual-fire)
+            let chosen_aim = if let Some((_, lw)) = light_slot {
+                let l_range = lw.stat_f64("range", 45.0);
+                if d < l_range * 1.1 {
+                    let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.45;
+                    if let Some((_, gw)) = gun_slot {
+                        if gw.reload <= 0.0
+                            && gw.ammo != Some(0)
+                            && angle_diff(gun_lead[0], instant_aim[0]).abs() <= cone * 0.80
+                        {
+                            gun_lead
                         } else {
-                            score -= (future_los as f64) * 65.0;
+                            instant_aim
                         }
-                        if self.nav.is_near_cover(lx, ly) {
-                            score += 18.0;
+                    } else {
+                        instant_aim
+                    }
+                } else if laser_slot
+                    .map_or(false, |(_, w)| laser_charging || w.cooldown < 0.2)
+                {
+                    instant_aim
+                } else {
+                    gun_lead
+                }
+            } else if laser_slot.map_or(false, |(_, w)| laser_charging || w.cooldown < 0.2) {
+                instant_aim
+            } else {
+                gun_lead
+            };
+
+            aim_yaw = chosen_aim[0];
+            aim_pitch = chosen_aim[1];
+            want_aim = true;
+
+            let pred_aim = predict_aim_after_step(me.aim, [aim_yaw, aim_pitch], turn_rate, pitch_rate);
+            let tol = (2.2 * t_scale).atan2(d.max(1.0));
+
+            if seen && has_los {
+                // Arm Gun
+                if let Some((gi, gw)) = gun_slot {
+                    let g_range = gw.stat_f64("range", 230.0);
+                    if gw.reload <= 0.0 && gw.ammo == Some(0) {
+                        act.reload = true;
+                    } else if gw.reload <= 0.0 && d < g_range {
+                        let g_yaw_err = angle_diff(pred_aim[0], gun_lead[0]).abs();
+                        let g_pitch_err = (pred_aim[1] - gun_lead[1]).abs();
+                        let dir = aim_dir(pred_aim);
+                        let barrel_tip = [
+                            muzzle[0] + dir[0] * (me.radius() + 0.5),
+                            muzzle[1] + dir[1] * (me.radius() + 0.5),
+                            muzzle[2] + dir[2] * (me.radius() + 0.5),
+                        ];
+                        if g_yaw_err < tol * 1.25
+                            && g_pitch_err < tol * 2.0 + 0.03
+                            && self.world.raycast_solid(muzzle, barrel_tip).is_none()
+                        {
+                            act.fire[gi] = true;
                         }
-                    } else if let Some(pm) = primary_mech {
-                        let to_x = pm.pos[0] - pos[0];
-                        let to_y = pm.pos[1] - pos[1];
-                        let d = (to_x * to_x + to_y * to_y).sqrt().max(1.0);
-                        let sx = -(to_y / d) * self.strafe_sign;
-                        let sy = (to_x / d) * self.strafe_sign;
+                    }
+                }
 
-                        score += (ux * sx + uy * sy) * 46.0;
+                // Lightning
+                if let Some((li, lw)) = light_slot {
+                    let l_range = lw.stat_f64("range", 45.0);
+                    let l_cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.47;
+                    let l_eng = lw.stat_f64("energy", 3.0);
+                    let l_yaw_err = angle_diff(pred_aim[0], instant_aim[0]).abs();
+                    if d < l_range - 0.5 && l_yaw_err < l_cone && me.energy > l_eng + 2.0 {
+                        act.fire[li] = true;
+                    }
+                }
+            }
 
-                        let new_d = ((pm.pos[0] - lx).powi(2) + (pm.pos[1] - ly).powi(2)).sqrt();
-                        score += ((d - ideal_dist).abs() - (new_d - ideal_dist).abs()) * 4.5;
+            // Laser: charge aggressively, release on full or lethal with corner-clear check
+            if let Some((li, lw)) = laser_slot {
+                let range = lw.stat_f64("range", 280.0);
+                let full = lw.stat_f64("charge", 0.75);
+                let min_chg = lw.stat_f64("min_charge", 0.15);
+                let min_frac = lw.stat_f64("min_frac", 0.35);
+                let base_dmg = lw.stat_f64("damage", 315.0);
+                let hold_s = lw.stat_f64("hold_s", 2.0);
+                let ch = lw.charge;
 
-                        // Soft corner slicing: bias strafe side to keep flankers behind walls
-                        if !secondary_eyes.is_empty() && !duck_on_cooldown {
-                            let flank_los = secondary_eyes
-                                .iter()
-                                .filter(|&&se| self.world.raycast_solid(se, cand_eye).is_none())
-                                .count();
-                            if flank_los == 0 && future_los == 1 {
-                                score += 28.0;
-                            } else if flank_los > 0 {
-                                score -= (flank_los as f64) * 20.0;
-                            }
-                        }
+                if ch > 0.0 {
+                    let frac = min_frac + (1.0 - min_frac) * (ch / full.max(0.05)).clamp(0.0, 1.0);
+                    let enemy_mortar = tr.weapons.iter().any(|w| w == "mortar");
+                    let expected_dmg =
+                        base_dmg * frac * if enemy_mortar { 1.6 } else { 1.0 } * cube_mult;
 
-                        if duck_on_cooldown {
-                            if future_los == 0 {
-                                score += 75.0;
-                            }
-                            if self.nav.is_near_cover(lx, ly) {
-                                score += 18.0;
-                            }
-                        } else if future_los == 1 {
-                            score += 20.0;
+                    let cur_yaw_err = angle_diff(me.aim[0], instant_aim[0]).abs();
+                    let cur_pitch_err = (me.aim[1] - instant_aim[1]).abs();
+                    let dir = aim_dir(me.aim);
+                    let beam_dist = (d - 3.0).max(me.radius() + 0.5);
+                    let beam_end = [
+                        muzzle[0] + dir[0] * beam_dist,
+                        muzzle[1] + dir[1] * beam_dist,
+                        muzzle[2] + dir[2] * beam_dist,
+                    ];
+                    let beam_clear = self.world.raycast_solid(muzzle, beam_end).is_none();
+
+                    let ready = ch >= full - 0.05
+                        || (ch >= min_chg && expected_dmg >= tr.hp * 1.02);
+                    let aligned = seen
+                        && has_los
+                        && cur_yaw_err < tol * 0.95
+                        && cur_pitch_err < tol * 1.5 + 0.02
+                        && beam_clear;
+                    let hold_expired = ch >= full + hold_s - 0.20;
+
+                    if (ready && aligned) || hold_expired {
+                        act.fire[li] = false;
+                    } else {
+                        act.fire[li] = true;
+                    }
+                } else if lw.cooldown <= 0.05 && seen && d < range && (has_los || d < 60.0) {
+                    act.fire[li] = true;
+                }
+            }
+
+            // Dual-arc Mortar (only when not firing primary arms or holding laser charge)
+            if let Some((mi, mw)) = mortar_slot {
+                if !act.fire[0] && !act.fire[1] && !laser_charging && mw.cooldown <= 0.05 && d > 16.0 && d < 225.0 {
+                    let splash_r = mw.stat_f64("splash_radius", 7.0);
+                    let speed = mw.stat_f64("speed", self.cfg.mortar_speed);
+                    let (m_pos, m_vel) =
+                        compute_mortar_aim_point(obs, tr.id, tr.pos, tr.vel, splash_r);
+                    if let Some(sol) =
+                        solve_mortar(obs, &self.cfg, &self.world, m_pos, m_vel, speed, splash_r)
+                    {
+                        aim_yaw = sol.aim[0];
+                        aim_pitch = sol.aim[1];
+                        let pred = predict_aim_after_step(me.aim, sol.aim, turn_rate, pitch_rate);
+                        if angle_diff(pred[0], sol.aim[0]).abs() < 0.06
+                            && (pred[1] - sol.aim[1]).abs() < 0.06
+                        {
+                            act.fire[mi] = true;
                         }
                     }
                 }
             }
 
-            if score > best_score {
-                best_score = score;
-                best_yaw = yaw;
+            // Threat-scaled combat movement & retreat
+            let their_frac = tr.hp / tr.max_hp.max(1.0);
+            let finishing = their_frac < 0.20 && hp_frac > 0.20 && threats <= 2;
+            let losing = !finishing
+                && ((hp_frac < 0.35 && their_frac > hp_frac + 0.10)
+                    || (threats >= 2 && hp_frac < 0.55)
+                    || (threats >= 3 && hp_frac < 0.80));
+            if losing {
+                self.hide_until = t + 6.0;
+            }
+
+            let prefer = if let Some((_, lw)) = light_slot {
+                (lw.stat_f64("range", 45.0) - 15.0).max(28.0)
+            } else if laser_slot.is_some() {
+                110.0
+            } else {
+                70.0
+            };
+
+            if losing {
+                let primary_eye = [tp[0], tp[1], tp[2] + 8.0 * t_scale];
+                if let Some(cov) = self.nav.cover_from(
+                    x,
+                    y,
+                    eye_off,
+                    &active_threat_eyes,
+                    primary_eye,
+                    50.0,
+                    zn.center,
+                    zn.radius,
+                    &self.world,
+                ) {
+                    move_goal = Some(cov);
+                } else {
+                    move_goal = Some([x - (tp[0] - x), y - (tp[1] - y)]);
+                }
+                boost = me.energy > 15.0;
+            } else {
+                let dirx = (tp[0] - x) / d.max(1.0);
+                let diry = (tp[1] - y) / d.max(1.0);
+                let mut radial = 0.0;
+                if d > prefer + 15.0 {
+                    radial = 1.0;
+                    if light_slot.is_some() && d < 90.0 && me.energy > 70.0 {
+                        boost = true;
+                    }
+                } else if d < prefer - 15.0 {
+                    radial = -0.7;
+                }
+                if !has_los && !seen {
+                    radial = 1.0;
+                }
+                if t > self.strafe_until {
+                    self.strafe_dir = if self.next_rng() < 0.5 { -1.0 } else { 1.0 };
+                    self.strafe_until = t + 0.35 + self.next_rng() * 0.70;
+                }
+                let strafe = self.strafe_dir;
+
+                // Boost-strafe when target aims a charging laser at us
+                if tr.charging {
+                    let to_me = (y - tp[1]).atan2(x - tp[0]);
+                    if angle_diff(tr.aim[0], to_me).abs() < 0.25 {
+                        boost = me.energy > if light_slot.is_some() { 45.0 } else { 10.0 };
+                    }
+                }
+
+                let mx = dirx * radial - diry * strafe * 0.9;
+                let my = diry * radial + dirx * strafe * 0.9;
+                if radial > 0.0 && !has_los {
+                    self.nav.field(tp[0], tp[1]);
+                    self.nav.pump(5.0, 120_000);
+                    if self.nav.field_for(tp[0], tp[1], 30.0) {
+                        if let Some(st) = self.nav.steer(x, y) {
+                            move_goal = Some([
+                                x + st[0] * 10.0 - diry * strafe * 3.0,
+                                y + st[1] * 10.0 + dirx * strafe * 3.0,
+                            ]);
+                        }
+                    }
+                    if move_goal.is_none() {
+                        move_goal = Some([x + mx * 10.0, y + my * 10.0]);
+                    }
+                } else {
+                    move_goal = Some([x + mx * 10.0, y + my * 10.0]);
+                }
+            }
+
+            // Mid-fight cube scooping / weapon grab
+            let cube_thresh = if losing {
+                12.0
+            } else if hp_frac > 0.5 {
+                70.0
+            } else {
+                40.0
+            };
+            if let Some(nc) = near_cube {
+                if near_cube_d < cube_thresh {
+                    move_goal = Some([nc[0], nc[1]]);
+                }
+            } else if let Some(np) = near_pick {
+                if !losing && near_pick_d < if only_gun { 60.0 } else { 35.0 } {
+                    move_goal = Some([np[0], np[1]]);
+                }
+            }
+
+            if zone_goal.is_some() && !me.in_zone {
+                move_goal = None;
             }
         }
 
-        if self.stuck_ticks >= 8 && obs.me.grounded {
-            act.jump = true;
-            best_yaw += 0.9 * self.strafe_sign;
+        // 7. Silent cover healing between waves
+        let healing = move_goal.is_none()
+            && target.is_none()
+            && zone_goal.is_none()
+            && near_cube_d > 40.0
+            && (hp_frac < 0.55 || (t < self.hide_until && hp_frac < 0.90));
+        if healing {
+            navigating = true;
+            if let Some(last_tr) = self
+                .belief
+                .tracks
+                .values()
+                .max_by(|a, b| a.t.total_cmp(&b.t))
+            {
+                let l_eye = [last_tr.pos[0], last_tr.pos[1], last_tr.pos[2] + 8.0];
+                let my_body = [x, y, z + 6.0];
+                if self.world.raycast_solid(l_eye, my_body).is_none() {
+                    if let Some(cov) = self.nav.cover_from(
+                        x,
+                        y,
+                        eye_off,
+                        &active_threat_eyes,
+                        l_eye,
+                        36.0,
+                        zn.center,
+                        zn.radius,
+                        &self.world,
+                    ) {
+                        move_goal = Some(cov);
+                        slow = true;
+                    }
+                }
+            }
         }
 
-        if !self.world.is_walkable_step(
-            pos,
-            pos[0] + best_yaw.cos() * 4.5,
-            pos[1] + best_yaw.sin() * 4.5,
-            radius + 0.2,
-            height,
-            self.cfg.step_up,
-            self.cfg.max_slope_deg,
-        ) {
-            self.strafe_sign = -self.strafe_sign;
-            self.last_strafe_flip = obs.tick;
+        // 8. Zone rotation / Economy-first looting / Roaming
+        if move_goal.is_none() && !healing {
+            if let Some(zg) = zone_goal {
+                navigating = true;
+                move_goal = Some(zg);
+                boost = !me.in_zone && me.energy > 20.0;
+            } else if !in_fight {
+                navigating = true;
+                let mut best: Option<[f64; 2]> = None;
+                let mut bs = f64::INFINITY;
+
+                // Ground weapon pickups
+                for p in self.belief.pick_mem.values() {
+                    if self.want_kind(obs, &p.kind).is_none() {
+                        continue;
+                    }
+                    let d = (p.pos[0] - x).hypot(p.pos[1] - y);
+                    let s = d - weapon_pref(&p.kind) * 20.0 - if only_gun { 50.0 } else { 0.0 };
+                    if s < bs {
+                        bs = s;
+                        best = Some([p.pos[0], p.pos[1]]);
+                    }
+                }
+
+                // Ground loose cubes (uncapped)
+                for c in self.belief.cube_mem.values() {
+                    let s = (c.pos[0] - x).hypot(c.pos[1] - y) - 30.0;
+                    if s < bs {
+                        bs = s;
+                        best = Some([c.pos[0], c.pos[1]]);
+                    }
+                }
+
+                // Supply drops (uncontested, reachable in time, safe in zone, ground-level)
+                for dr in &obs.drops {
+                    let gz = self.world.terrain_height(dr.pos[0], dr.pos[1]);
+                    if (dr.pos[2] - gz).abs() > 2.5 {
+                        continue;
+                    }
+                    if dr.holder.map_or(false, |h| h != me.id) {
+                        continue;
+                    }
+                    let d = (dr.pos[0] - x).hypot(dr.pos[1] - y);
+                    if d > 220.0 || dr.lands_in > d / walk_speed + 3.0 {
+                        continue;
+                    }
+                    let zr = (dr.pos[0] - zn.next_center[0]).hypot(dr.pos[1] - zn.next_center[1]);
+                    if zr > zn.next_radius && time_to_shrink < 15.0 {
+                        continue;
+                    }
+                    let sc = d - 80.0;
+                    if sc < bs {
+                        bs = sc;
+                        best = Some(if d < (dr.radius - 3.0).max(2.0) {
+                            [x, y]
+                        } else {
+                            [dr.pos[0], dr.pos[1]]
+                        });
+                    }
+                }
+
+                // Remembered NPC drones (uncapped)
+                if hp_frac > 0.50 {
+                    for nm in self.belief.npc_mem.values() {
+                        let d = (nm.pos[0] - x).hypot(nm.pos[1] - y);
+                        if d > 170.0 {
+                            continue;
+                        }
+                        let sc = d - 20.0;
+                        if sc < bs {
+                            bs = sc;
+                            best = Some(if d > 38.0 {
+                                [nm.pos[0], nm.pos[1]]
+                            } else {
+                                [x, y]
+                            });
+                        }
+                    }
+                }
+
+                // Ground crates (uncapped)
+                if hp_frac > 0.45 {
+                    for c in &obs.crates {
+                        let gz = self.world.terrain_height(c.pos[0], c.pos[1]);
+                        if (c.pos[2] - gz).abs() > 2.0 {
+                            continue;
+                        }
+                        let d = (c.pos[0] - x).hypot(c.pos[1] - y);
+                        if d > 150.0 {
+                            continue;
+                        }
+                        let sc = d + 5.0;
+                        if sc < bs {
+                            bs = sc;
+                            best = Some(if d > 30.0 {
+                                [c.pos[0], c.pos[1]]
+                            } else {
+                                [x, y]
+                            });
+                        }
+                    }
+                }
+
+                if let Some(bg) = best {
+                    move_goal = Some(bg);
+                } else {
+                    let ang = (y - zn.next_center[1]).atan2(x - zn.next_center[0]);
+                    let r = (zn.next_radius * 0.6).min((d_next - 30.0).max(20.0));
+                    move_goal = Some([
+                        zn.next_center[0] + ang.cos() * r,
+                        zn.next_center[1] + ang.sin() * r,
+                    ]);
+                }
+
+                // Shoot visible NPCs / crates when safe
+                let unseen_attacker = t - self.belief.mech_hit_t < 1.5;
+                if hp_frac > 0.40 && !unseen_attacker {
+                    let best_npc = obs
+                        .mechs
+                        .iter()
+                        .filter(|m| {
+                            m.kind == "npc"
+                                && (m.pos[0] - x).hypot(m.pos[1] - y) < 110.0
+                                && self
+                                    .world
+                                    .raycast_solid(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 1.75])
+                                    .is_none()
+                        })
+                        .min_by(|a, b| {
+                            (a.pos[0] - x)
+                                .hypot(a.pos[1] - y)
+                                .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                        });
+                    let best_crate = obs
+                        .crates
+                        .iter()
+                        .filter(|c| {
+                            (c.pos[0] - x).hypot(c.pos[1] - y) < 120.0
+                                && self
+                                    .world
+                                    .raycast_solid(muzzle, [c.pos[0], c.pos[1], c.pos[2] + 1.2])
+                                    .is_none()
+                        })
+                        .min_by(|a, b| {
+                            (a.pos[0] - x)
+                                .hypot(a.pos[1] - y)
+                                .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                        });
+
+                    let farm_tgt: Option<([f64; 3], [f64; 3], f64, bool)> = if let Some(n) = best_npc
+                    {
+                        Some((n.pos, n.vel, 1.75, false))
+                    } else {
+                        best_crate.map(|c| (c.pos, [0.0, 0.0, 0.0], 1.2, true))
+                    };
+
+                    if let Some((fpos, fvel, fh, is_crate)) = farm_tgt {
+                        let dd = (fpos[0] - x).hypot(fpos[1] - y);
+                        let g_spd = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
+                        let tt = dd / g_spd.max(1.0);
+                        let px = fpos[0] + fvel[0] * tt;
+                        let py = fpos[1] + fvel[1] * tt;
+                        aim_yaw = (py - y).atan2(px - x);
+                        aim_pitch = (fpos[2] + fh - muzzle_z).atan2(dd.max(1e-4));
+                        want_aim = true;
+
+                        let pred =
+                            predict_aim_after_step(me.aim, [aim_yaw, aim_pitch], turn_rate, pitch_rate);
+                        let tol = 1.3_f64.atan2(dd.max(1.0));
+                        if angle_diff(pred[0], aim_yaw).abs() < tol
+                            && (pred[1] - aim_pitch).abs() < tol * 2.0 + 0.02
+                        {
+                            if let Some((gi, gw)) = gun_slot {
+                                if gw.reload <= 0.0 {
+                                    act.fire[gi] = true;
+                                }
+                            }
+                            if let Some((li, lw)) = light_slot {
+                                let l_rng = lw.stat_f64("range", 45.0);
+                                let l_eng = lw.stat_f64("energy", 3.0);
+                                if dd < l_rng - 3.0 && me.energy > l_eng + 2.0 {
+                                    act.fire[li] = true;
+                                }
+                            }
+                        }
+                        if is_crate && dd < 25.0 {
+                            move_goal = Some([fpos[0], fpos[1]]);
+                        }
+                    }
+                }
+            }
         }
 
-        let mut mag = 1.0;
-        if self.belief.mode == MatchMode::FfaSurvival
-            && !in_combat
-            && !urgent_dodge
-            && self.is_in_safe_next_zone(pos[0], pos[1], obs, 15.0)
-            && obs.zone.radius <= 160.0
+        // 9. Movement execution via 2 m Dijkstra flow-field
+        let mut mv = [0.0_f64, 0.0_f64];
+        if let Some(mg) = move_goal {
+            let gd = (mg[0] - x).hypot(mg[1] - y);
+            if gd > 3.0 {
+                let gz = self.world.terrain_height(mg[0], mg[1]);
+                let direct = self
+                    .world
+                    .raycast_solid([x, y, z + 2.0], [mg[0], mg[1], gz + 2.0])
+                    .is_none();
+                let check_ground = navigating
+                    && me.grounded
+                    && (z - self.world.terrain_height(x, y)).abs() < 2.0;
+                if direct
+                    && gd < 60.0
+                    && (!check_ground || self.nav.walk_segment(x, y, mg[0], mg[1]))
+                {
+                    mv = [(mg[0] - x) / gd, (mg[1] - y) / gd];
+                } else {
+                    self.nav.field(mg[0], mg[1]);
+                    self.nav.pump(6.0, 140_000);
+                    let st = if self.nav.field_for(mg[0], mg[1], 25.0) {
+                        self.nav.steer(x, y)
+                    } else {
+                        None
+                    };
+                    mv = st.unwrap_or([(mg[0] - x) / gd, (mg[1] - y) / gd]);
+                }
+            }
+        }
+
+        if slow {
+            let silent_scale = ((self.cfg.sound_step_speed - 0.35) / walk_speed).clamp(0.25, 0.42);
+            mv = [mv[0] * silent_scale, mv[1] * silent_scale];
+        } else if is_ffa
+            && !in_fight
+            && d_next <= (zn.next_radius - 15.0).max(4.0)
+            && zn.radius <= 160.0
         {
-            mag = ((self.cfg.sound_step_speed - 0.35) / obs.me.walk_speed()).clamp(0.25, 1.0);
+            let silent_scale = ((self.cfg.sound_step_speed - 0.35) / walk_speed).clamp(0.25, 1.0);
+            mv = [mv[0] * silent_scale, mv[1] * silent_scale];
         }
 
-        act.move_dir = [best_yaw.cos() * mag, best_yaw.sin() * mag];
+        // 10. Iter 38 relative-velocity bullet, mortar, and laser dodge
+        let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
+        let dodge_len = dodge[0].hypot(dodge[1]);
+        if dodge_len > 0.05 {
+            let dx = dodge[0] / dodge_len;
+            let dy = dodge[1] / dodge_len;
+            mv = [mv[0] * 0.3 + dx * 0.95, mv[1] * 0.3 + dy * 0.95];
+            let ml = mv[0].hypot(mv[1]);
+            if ml > 1.0 {
+                mv = [mv[0] / ml, mv[1] / ml];
+            }
+            let min_e = if light_slot.is_some() && target.is_some() {
+                55.0
+            } else if urgent_dodge {
+                15.0
+            } else {
+                25.0
+            };
+            if me.energy > min_e {
+                boost = true;
+            }
+        }
 
-        let min_boost_energy = if urgent_dodge || !obs.me.in_zone {
-            6.0
-        } else if has_lightning {
-            38.0
-        } else {
-            20.0
-        };
-        let early_loot_sprint =
-            !in_combat && obs.me.cubes < self.cfg.cube_stat_cap && obs.me.energy > 72.0;
-        let need_sprint = urgent_dodge
-            || !obs.me.in_zone
-            || (seek_heal && los_enemies > 0)
-            || early_loot_sprint;
-        act.boost = need_sprint
-            && !laser_charging
-            && obs.me.grounded
-            && obs.me.energy >= min_boost_energy;
+        // Keep strafing / dodging inside the active storm ring
+        if me.in_zone && mv[0].hypot(mv[1]) > 0.05 {
+            let nx = x + mv[0] * 4.5;
+            let ny = y + mv[1] * 4.5;
+            if (nx - zn.center[0]).hypot(ny - zn.center[1]) > (zn.radius - 2.5).max(3.0) {
+                let ix = zn.center[0] - x;
+                let iy = zn.center[1] - y;
+                let il = ix.hypot(iy).max(1e-4);
+                mv = [ix / il, iy / il];
+            }
+        }
+
+        // 11. Stuck handling: 0.6 s jump + jet recovery
+        let moved = (x - self.last_pos[0]).hypot(y - self.last_pos[1]);
+        if (mv[0] != 0.0 || mv[1] != 0.0) && moved < 0.25 && me.grounded {
+            self.stuck_t += 0.1;
+        } else if moved > 0.6 {
+            self.stuck_t = 0.0;
+        }
+        if self.stuck_t > 0.6 {
+            jump = true;
+            boost = me.energy > 10.0;
+            if self.stuck_t > 2.5 {
+                mv = [-mv[1] * self.strafe_dir, mv[0] * self.strafe_dir];
+            }
+            if self.stuck_t > 4.0 {
+                self.stuck_t = 0.0;
+            }
+        }
+        if !me.grounded && self.stuck_t > 0.0 {
+            boost = me.energy > 5.0;
+        }
+        self.last_pos = [x, y, z];
+
+        // 12. Active idle scanning (fast 360° spawn sweep + forward weave)
+        if !want_aim {
+            if t < 3.0 {
+                aim_yaw = me.aim[0] + 1.6;
+            } else if t - self.belief.mech_hit_t < 2.0 {
+                aim_yaw = self.belief.mech_hit_bearing;
+            } else if let Some(tb) = self.belief.threat_bearing {
+                if t - self.belief.threat_t < 3.0 {
+                    aim_yaw = tb;
+                } else if mv[0] != 0.0 || mv[1] != 0.0 {
+                    self.scan_phase += 0.1;
+                    aim_yaw = mv[1].atan2(mv[0]) + (self.scan_phase * 1.3).sin() * 0.9;
+                } else {
+                    self.scan_phase += 0.1;
+                    aim_yaw = me.aim[0] + 0.6;
+                }
+            } else if mv[0] != 0.0 || mv[1] != 0.0 {
+                self.scan_phase += 0.1;
+                aim_yaw = mv[1].atan2(mv[0]) + (self.scan_phase * 1.3).sin() * 0.9;
+            } else {
+                self.scan_phase += 0.1;
+                aim_yaw = me.aim[0] + 0.6;
+            }
+            aim_pitch = 0.0;
+        }
+
+        // Keep laser charging across brief target blinks
+        if let Some((li, lw)) = laser_slot {
+            if laser_charging && !act.fire[li] && lw.charge < lw.stat_f64("charge", 0.75) - 0.05 {
+                act.fire[li] = true;
+            }
+        }
+
+        // Safe reload when out of fight (or empty mag)
+        if let Some((gi, gw)) = gun_slot {
+            let mag = gw.stat_f64("mag", 12.0).max(1.0);
+            let ammo = gw.ammo.unwrap_or(mag as u32) as f64;
+            if gw.reload <= 0.0 && !act.fire[gi] {
+                if ammo <= 0.0 || (!in_fight && ammo < mag * 0.5) {
+                    act.reload = true;
+                }
+            }
+        }
+
+        act.move_dir = mv;
+        act.aim = [wrap_angle(aim_yaw), aim_pitch];
+        act.boost = boost && !laser_charging;
+        act.jump = jump;
+        act.sanitize(self.cfg.min_pitch, self.cfg.max_pitch);
+
+        // Spend remaining small budget finishing any pending flow field
+        if self.nav.is_pending() {
+            let elapsed_ms = tick_t0.elapsed().as_secs_f64() * 1000.0;
+            let rem = (12.0 - elapsed_ms).max(0.0);
+            if rem > 0.5 {
+                self.nav.pump(rem, 120_000);
+            }
+        }
+
+        act
     }
 }
 
@@ -1091,7 +996,7 @@ fn main() {
         }
     };
 
-    let mut brain = BotBrain::new(cfg, world);
+    let mut brain = BotBrain::new(hello.seed, cfg, world);
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
