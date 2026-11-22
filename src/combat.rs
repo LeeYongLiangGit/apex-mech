@@ -682,7 +682,9 @@ pub fn decide_combat(
                 if let Some((gi, gw)) = gun_slot {
                     let g_range = gw.stat_f64("range", 230.0);
                     let g_speed = gw.stat_f64("speed", 252.0);
-                    if gw.reload <= 0.0 && t.dist <= g_range {
+                    if gw.reload <= 0.0 && gw.ammo == Some(0) {
+                        act.reload = true;
+                    } else if gw.reload <= 0.0 && t.dist <= g_range {
                         let lead = lead_aim(muzzle, t.pos, t.vel, g_speed, world);
                         if angle_diff(lead[0], direct_aim[0]).abs() <= cone * 0.78 {
                             chosen_aim = lead;
@@ -940,6 +942,7 @@ pub fn decide_combat(
 
 pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2], bool) {
     let pos = obs.me.pos;
+    let my_vel = obs.me.vel;
     let my_center = [pos[0], pos[1], pos[2] + 0.5 * obs.me.height()];
     let radius = obs.me.radius();
     let mut dodge = [0.0, 0.0];
@@ -951,6 +954,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             let mut cur = p.pos;
             let mut vel = p.vel;
             let dt = 0.08;
+            let danger_r = (radius + 7.5).max(10.0);
             for step in 1..=40 {
                 let next = [
                     cur[0] + vel[0] * dt,
@@ -959,17 +963,17 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                 ];
                 vel[2] -= g * dt;
                 let hit = next[2] <= world.terrain_height(next[0], next[1]) + 0.2
-                    || (step % 4 == 0 && world.raycast_solid(cur, next).is_some());
+                    || (step % 2 == 0 && world.raycast_solid(cur, next).is_some());
                 cur = next;
                 if hit {
                     let t_imp = step as f64 * dt;
                     let dx = pos[0] - cur[0];
                     let dy = pos[1] - cur[1];
                     let d = (dx * dx + dy * dy).sqrt();
-                    if d < 9.5 && t_imp < 2.2 {
+                    if d < danger_r && t_imp < 2.2 {
                         let ux = if d > 0.1 { dx / d } else { 1.0 };
                         let uy = if d > 0.1 { dy / d } else { 0.0 };
-                        let w = (10.0 - d) * 0.85;
+                        let w = (danger_r + 0.8 - d) * 0.9;
                         dodge[0] += ux * w;
                         dodge[1] += uy * w;
                         urgent = true;
@@ -984,27 +988,55 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             if v2 < 4.0 {
                 continue;
             }
-            let t_closest = (rx * p.vel[0] + ry * p.vel[1]) / v2;
-            if !(0.0..=0.85).contains(&t_closest) {
-                continue;
-            }
-            let cx = p.pos[0] + p.vel[0] * t_closest;
-            let cy = p.pos[1] + p.vel[1] * t_closest;
-            let cz = p.pos[2] + p.vel[2] * t_closest;
-            if (cz - my_center[2]).abs() > obs.me.height() * 0.65 {
-                continue;
-            }
-            let mx = my_center[0] - cx;
-            let my = my_center[1] - cy;
-            let miss_d = (mx * mx + my * my).sqrt();
-            if miss_d < radius + 2.3 {
-                let spd = v2.sqrt();
-                let px = -p.vel[1] / spd;
-                let py = p.vel[0] / spd;
-                let sign = if mx * px + my * py >= 0.0 { 1.0 } else { -1.0 };
+            let spd = v2.sqrt();
+            let px = -p.vel[1] / spd;
+            let py = p.vel[0] / spd;
+            let thresh = radius + 2.3;
+
+            // Static closest approach (current position vs bullet line)
+            let t_stat = (rx * p.vel[0] + ry * p.vel[1]) / v2;
+            let mx_stat = my_center[0] - (p.pos[0] + p.vel[0] * t_stat);
+            let my_stat = my_center[1] - (p.pos[1] + p.vel[1] * t_stat);
+            let cz_stat = p.pos[2] + p.vel[2] * t_stat;
+            let miss_d_stat = (mx_stat * mx_stat + my_stat * my_stat).sqrt();
+            let stat_threat = (0.0..=0.85).contains(&t_stat)
+                && (cz_stat - my_center[2]).abs() <= obs.me.height() * 0.65
+                && miss_d_stat < thresh;
+
+            // Relative-velocity closest approach (catches enemy lead shots on our current trajectory)
+            let rvx = p.vel[0] - my_vel[0];
+            let rvy = p.vel[1] - my_vel[1];
+            let rv2 = rvx * rvx + rvy * rvy;
+            let (rel_threat, t_rel, mx_rel, my_rel) = if rv2 >= 4.0 {
+                let tr = (rx * rvx + ry * rvy) / rv2;
+                let mxr = rx - rvx * tr;
+                let myr = ry - rvy * tr;
+                let czr = p.pos[2] + p.vel[2] * tr;
+                let my_zr = my_center[2] + my_vel[2] * tr;
+                let miss_r = (mxr * mxr + myr * myr).sqrt();
+                let hit = (0.0..=0.85).contains(&tr)
+                    && (czr - my_zr).abs() <= obs.me.height() * 0.65
+                    && miss_r < thresh;
+                (hit, tr, mxr, myr)
+            } else {
+                (false, t_stat, mx_stat, my_stat)
+            };
+
+            if stat_threat || rel_threat {
+                // Stay on our current safe side of the bullet line to avoid crossing incoming shots
+                let side_stat = mx_stat * px + my_stat * py;
+                let side_rel = mx_rel * px + my_rel * py;
+                let sign = if side_stat.abs() >= 0.4 {
+                    if side_stat >= 0.0 { 1.0 } else { -1.0 }
+                } else if side_rel >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 dodge[0] += px * sign * 3.4;
                 dodge[1] += py * sign * 3.4;
-                if t_closest < 0.40 {
+                let t_hit = if rel_threat { t_rel } else { t_stat };
+                if t_hit < 0.40 && (rel_threat || miss_d_stat < radius + 1.0) {
                     urgent = true;
                 }
             }

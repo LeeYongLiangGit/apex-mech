@@ -729,11 +729,6 @@ impl BotBrain {
         let has_laser = laser_w.is_some();
         let laser_charging = laser_w.map_or(false, |w| w.charge > 0.0);
 
-        if obs.tick.saturating_sub(self.last_strafe_flip) >= 18 {
-            self.strafe_sign = -self.strafe_sign;
-            self.last_strafe_flip = obs.tick;
-        }
-
         // Strictly currently-visible enemy mechs within 155 m (top 4 closest) for combat steering
         let mut vis_enemies: Vec<(f64, [f64; 3])> = obs
             .mechs
@@ -749,6 +744,12 @@ impl BotBrain {
         vis_enemies.sort_by(|a, b| a.0.total_cmp(&b.0));
         vis_enemies.truncate(4);
         let visible_threat_eyes: Vec<[f64; 3]> = vis_enemies.into_iter().map(|(_, p)| p).collect();
+
+        let strafe_period = if !visible_threat_eyes.is_empty() { 8 } else { 18 };
+        if obs.tick.saturating_sub(self.last_strafe_flip) >= strafe_period {
+            self.strafe_sign = -self.strafe_sign;
+            self.last_strafe_flip = obs.tick;
+        }
 
         let goal = self.choose_macro_goal(
             obs,
