@@ -386,7 +386,7 @@ impl BotBrain {
 
     fn weapon_priority(&self, kind: &str, obs: &ObsMsg) -> i32 {
         match kind {
-            "lightning" => 100,
+            "lightning" => 115,
             "laser" => 97,
             "mortar" => {
                 if obs.zone.dps >= 100.0 || obs.zone.radius <= 140.0 {
@@ -404,7 +404,7 @@ impl BotBrain {
         if a == b {
             return false;
         }
-        a == "lightning" || b == "lightning" || a == "gun" || b == "gun"
+        a == "gun" || b == "gun"
     }
 
     fn handle_weapon_pickup(&self, obs: &ObsMsg, los_enemies: usize, act: &mut Action) {
