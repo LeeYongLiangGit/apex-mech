@@ -8,6 +8,7 @@ use belief::{BeliefMap, MatchMode, TrackedMech};
 use combat::*;
 use nav::NavEngine;
 use protocol::*;
+use std::f64::consts::PI;
 use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 use world::World;
@@ -172,6 +173,8 @@ impl BotBrain {
         let me = &obs.me;
         let [x, y, z] = me.pos;
         let t = obs.t;
+        let radius = me.radius();
+        let height = me.height();
         let muzzle_z = z + me.muzzle_height();
         let eye_off = me.eye_height();
         let muzzle = [x, y, muzzle_z];
@@ -248,9 +251,11 @@ impl BotBrain {
             }
         }
 
-        // 4. Select primary enemy mech target (dual-height LOS; stop 4 s ghost chasing)
+        // 4. Select primary enemy mech target (dual-height LOS, kill-focus & signature bonuses)
         let is_ffa = self.belief.mode == MatchMode::FfaSurvival;
         let in_hide_window = t < self.hide_until && hp_frac < 0.85;
+        let undergeared_with_loot =
+            (only_gun || me.cubes < 6) && (near_pick_d < 85.0 || near_cube_d < 70.0);
         let mut target: Option<(TrackedMech, [f64; 3], bool)> = None;
         let mut best_t_score = f64::INFINITY;
         for tr in self.belief.tracks.values() {
@@ -261,7 +266,6 @@ impl BotBrain {
             let (aim_pt, has_los) = self.dual_height_los(muzzle, tr);
             let visible_now = age < 0.15;
 
-            // Drop stale out-of-LOS ghosts quickly so cover healing & looting start immediately
             if in_hide_window && (!visible_now || !has_los) {
                 continue;
             }
@@ -281,14 +285,37 @@ impl BotBrain {
             if is_ffa && obs.alive > 5 && d > 105.0 && tr.hp > 1000.0 && !hit_us {
                 continue;
             }
+            if undergeared_with_loot && d > 115.0 && !hit_us && tr.hp > 900.0 {
+                continue;
+            }
+
+            let enemy_mortar = tr.weapons.iter().any(|w| w == "mortar");
+            let bearing_from_enemy = (y - tr.pos[1]).atan2(x - tr.pos[0]);
+            let rear_exposed = angle_diff(tr.aim[0], bearing_from_enemy).abs() > PI * 0.52;
+
             let hit_bonus = if hit_us { 50.0 } else { 0.0 };
             let stick_bonus = if self.target_id == Some(tr.id) && t - self.target_t < 2.0 {
-                40.0
+                45.0
             } else {
                 0.0
             };
-            let los_bonus = if has_los { 30.0 } else { 0.0 };
-            let s = d + (tr.hp / 1400.0) * 90.0 + age * 30.0 - hit_bonus - stick_bonus - los_bonus;
+            let los_bonus = if has_los { 35.0 } else { 0.0 };
+            let cookoff_bonus = if laser_slot.is_some() && enemy_mortar && has_los {
+                45.0
+            } else {
+                0.0
+            };
+            let charge_bonus = if tr.charging && has_los { 35.0 } else { 0.0 };
+            let rear_bonus = if rear_exposed && has_los { 25.0 } else { 0.0 };
+            let hp_term = (tr.hp / tr.max_hp.max(1.0)) * 135.0;
+
+            let s = d + hp_term + age * 30.0
+                - hit_bonus
+                - stick_bonus
+                - los_bonus
+                - cookoff_bonus
+                - charge_bonus
+                - rear_bonus;
             if s < best_t_score {
                 best_t_score = s;
                 target = Some((tr.clone(), aim_pt, has_los));
@@ -350,6 +377,7 @@ impl BotBrain {
 
         // 6. Combat & macro decision
         let mut move_goal: Option<[f64; 2]> = None;
+        let mut combat_mv: Option<[f64; 2]> = None;
         let mut aim_yaw = me.aim[0];
         let mut aim_pitch = 0.0_f64;
         let mut want_aim = false;
@@ -373,11 +401,12 @@ impl BotBrain {
             let age = (t - tr.t).max(0.0);
             let seen = age < 0.15;
 
-            // Compute threat-scaled retreat BEFORE weapon charging so Laser never locks out escapes
+            // Threat-scaled retreat with hide_until hysteresis (computed before Laser charge)
             let their_frac = tr.hp / tr.max_hp.max(1.0);
             let finishing = their_frac < 0.20 && hp_frac > 0.20 && threats <= 2;
             let losing = !finishing
                 && ((hp_frac < 0.35 && their_frac > hp_frac + 0.10)
+                    || (t < self.hide_until && hp_frac < 0.65 && their_frac > hp_frac + 0.15)
                     || (threats >= 2 && hp_frac < 0.55)
                     || (threats >= 3 && hp_frac < 0.80));
             is_losing = losing;
@@ -389,31 +418,48 @@ impl BotBrain {
             let gun_speed = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
             let gun_lead = lead_aim(muzzle, *aim_pt, tr.vel, age, gun_speed, &self.world);
 
-            // Weapon aim priority (with twin-arm Lightning + Gun dual-fire)
-            let want_laser_aim = !losing
-                && laser_slot.map_or(false, |(_, w)| laser_charging || w.cooldown < 0.2);
+            // Snap to instant_aim only during the final 0.20 s of Laser charge (or lethal release)
+            // so Arm Gun keeps firing full DPS throughout the first ~0.55 s of every Laser charge!
+            let laser_snap_aim = !losing
+                && laser_slot.map_or(false, |(_, lw)| {
+                    if lw.charge <= 0.0 {
+                        return false;
+                    }
+                    let full = lw.stat_f64("charge", 0.75);
+                    let min_chg = lw.stat_f64("min_charge", 0.15);
+                    let min_frac = lw.stat_f64("min_frac", 0.35);
+                    let base_dmg = lw.stat_f64("damage", 315.0);
+                    let hold_s = lw.stat_f64("hold_s", 2.0);
+                    let frac =
+                        min_frac + (1.0 - min_frac) * (lw.charge / full.max(0.05)).clamp(0.0, 1.0);
+                    let enemy_mortar = tr.weapons.iter().any(|w| w == "mortar");
+                    let expected_dmg =
+                        base_dmg * frac * if enemy_mortar { 1.6 } else { 1.0 } * cube_mult;
+                    lw.charge >= full - 0.20
+                        || (lw.charge >= min_chg && expected_dmg >= tr.hp * 1.02)
+                        || lw.charge >= full + hold_s - 0.35
+                });
+
+            let gun_ready_to_shoot = gun_slot
+                .map_or(false, |(_, gw)| gw.reload <= 0.0 && gw.ammo != Some(0));
+
             let chosen_aim = if let Some((_, lw)) = light_slot {
                 let l_range = lw.stat_f64("range", 45.0);
                 if d < l_range * 1.1 {
                     let cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.45;
-                    if let Some((_, gw)) = gun_slot {
-                        if gw.reload <= 0.0
-                            && gw.ammo != Some(0)
-                            && angle_diff(gun_lead[0], instant_aim[0]).abs() <= cone * 0.80
-                        {
-                            gun_lead
-                        } else {
-                            instant_aim
-                        }
+                    if gun_ready_to_shoot
+                        && angle_diff(gun_lead[0], instant_aim[0]).abs() <= cone * 0.80
+                    {
+                        gun_lead
                     } else {
                         instant_aim
                     }
-                } else if want_laser_aim {
+                } else if laser_snap_aim || (!gun_ready_to_shoot && laser_charging) {
                     instant_aim
                 } else {
                     gun_lead
                 }
-            } else if want_laser_aim {
+            } else if laser_snap_aim || (!gun_ready_to_shoot && laser_charging) {
                 instant_aim
             } else {
                 gun_lead
@@ -428,7 +474,7 @@ impl BotBrain {
             let tol = (2.2 * t_scale).atan2(d.max(1.0));
 
             if seen && *has_los {
-                // Arm Gun
+                // Arm Gun (fires freely during early Laser charge & inside Lightning cone)
                 if let Some((gi, gw)) = gun_slot {
                     let g_range = gw.stat_f64("range", 230.0);
                     if gw.reload <= 0.0 && gw.ammo == Some(0) {
@@ -438,9 +484,9 @@ impl BotBrain {
                         let g_pitch_err = (pred_aim[1] - gun_lead[1]).abs();
                         let dir = aim_dir(pred_aim);
                         let barrel_tip = [
-                            muzzle[0] + dir[0] * (me.radius() + 0.5),
-                            muzzle[1] + dir[1] * (me.radius() + 0.5),
-                            muzzle[2] + dir[2] * (me.radius() + 0.5),
+                            muzzle[0] + dir[0] * (radius + 0.5),
+                            muzzle[1] + dir[1] * (radius + 0.5),
+                            muzzle[2] + dir[2] * (radius + 0.5),
                         ];
                         if g_yaw_err < tol * 1.25
                             && g_pitch_err < tol * 2.0 + 0.03
@@ -484,7 +530,7 @@ impl BotBrain {
                     let cur_yaw_err = angle_diff(me.aim[0], instant_aim[0]).abs();
                     let cur_pitch_err = (me.aim[1] - instant_aim[1]).abs();
                     let dir = aim_dir(me.aim);
-                    let beam_dist = (d - 3.0).max(me.radius() + 0.5);
+                    let beam_dist = (d - 3.0).max(radius + 0.5);
                     let beam_end = [
                         muzzle[0] + dir[0] * beam_dist,
                         muzzle[1] + dir[1] * beam_dist,
@@ -546,13 +592,13 @@ impl BotBrain {
                 }
             }
 
-            // Combat movement, retreat, or holding an active supply drop
+            // Combat movement, Laser kiting, wall-safe strafing, or drop holding
             let prefer = if let Some((_, lw)) = light_slot {
-                (lw.stat_f64("range", 45.0) - 15.0).max(28.0)
+                (lw.stat_f64("range", 45.0) - 10.0).max(26.0)
             } else if laser_slot.is_some() {
-                110.0
+                125.0
             } else {
-                70.0
+                75.0
             };
 
             let hold_drop_in_fight = active_drop.filter(|dr| {
@@ -585,10 +631,9 @@ impl BotBrain {
                 if dd > inner_r {
                     move_goal = Some([dr.pos[0], dr.pos[1]]);
                 } else {
-                    // Micro-strafe inside the drop ring so we stay harder to hit while capturing
                     if t > self.strafe_until {
                         self.strafe_dir = if self.next_rng() < 0.5 { -1.0 } else { 1.0 };
-                        self.strafe_until = t + 0.35 + self.next_rng() * 0.55;
+                        self.strafe_until = t + 0.28 + self.next_rng() * 0.37;
                     }
                     let dirx = (tp[0] - x) / d.max(1.0);
                     let diry = (tp[1] - y) / d.max(1.0);
@@ -603,23 +648,41 @@ impl BotBrain {
             } else {
                 let dirx = (tp[0] - x) / d.max(1.0);
                 let diry = (tp[1] - y) / d.max(1.0);
+                let enemy_lightning = tr.weapons.iter().any(|w| w == "lightning");
+
                 let mut radial = 0.0;
                 if d > prefer + 15.0 {
                     radial = 1.0;
-                    if light_slot.is_some() && d < 90.0 && me.energy > 70.0 {
+                    if light_slot.is_some() && d < 90.0 && me.energy > 65.0 {
                         boost = true;
                     }
                 } else if d < prefer - 15.0 {
-                    radial = -0.7;
+                    if light_slot.is_none() {
+                        if enemy_lightning && d < 60.0 {
+                            radial = -1.35;
+                            if me.energy > 30.0 {
+                                boost = true;
+                            }
+                        } else if d < 70.0 {
+                            radial = -1.05;
+                            if d < 55.0 && me.energy > 50.0 {
+                                boost = true;
+                            }
+                        } else {
+                            radial = -0.75;
+                        }
+                    } else {
+                        radial = -0.7;
+                    }
                 }
                 if !*has_los && !seen {
                     radial = 1.0;
                 }
+
                 if t > self.strafe_until {
                     self.strafe_dir = if self.next_rng() < 0.5 { -1.0 } else { 1.0 };
-                    self.strafe_until = t + 0.35 + self.next_rng() * 0.70;
+                    self.strafe_until = t + 0.28 + self.next_rng() * 0.37;
                 }
-                let strafe = self.strafe_dir;
 
                 // Boost-strafe when target aims a charging laser at us
                 if tr.charging {
@@ -629,46 +692,83 @@ impl BotBrain {
                     }
                 }
 
-                let mx = dirx * radial - diry * strafe * 0.9;
-                let my = diry * radial + dirx * strafe * 0.9;
-                if radial > 0.0 && !*has_los {
+                // Mid-fight cube scooping / weapon grab (FIXED: falls through to near_pick!)
+                let cube_thresh = if hp_frac > 0.5 { 68.0 } else { 38.0 };
+                let pick_thresh = if only_gun { 65.0 } else { 40.0 };
+                if let Some(nc) = near_cube.filter(|_| near_cube_d < cube_thresh) {
+                    move_goal = Some([nc[0], nc[1]]);
+                } else if let Some(np) = near_pick.filter(|_| near_pick_d < pick_thresh) {
+                    move_goal = Some([np[0], np[1]]);
+                } else if radial > 0.0 && !*has_los {
                     self.nav.field(tp[0], tp[1]);
                     self.nav.pump(5.0, 120_000);
                     if self.nav.field_for(tp[0], tp[1], 30.0) {
                         if let Some(st) = self.nav.steer(x, y) {
-                            move_goal = Some([
-                                x + st[0] * 10.0 - diry * strafe * 3.0,
-                                y + st[1] * 10.0 + dirx * strafe * 3.0,
-                            ]);
+                            let fx = st[0] - diry * self.strafe_dir * 0.3;
+                            let fy = st[1] + dirx * self.strafe_dir * 0.3;
+                            let fl = fx.hypot(fy).max(1e-4);
+                            combat_mv = Some([fx / fl, fy / fl]);
                         }
                     }
-                    if move_goal.is_none() {
-                        move_goal = Some([x + mx * 10.0, y + my * 10.0]);
+                    if combat_mv.is_none() {
+                        move_goal = Some([tp[0], tp[1]]);
                     }
                 } else {
-                    move_goal = Some([x + mx * 10.0, y + my * 10.0]);
-                }
+                    // Wall-safe continuous strafe/kite vector (avoids thrashing nav.field)
+                    let walk_ok = |ux: f64, uy: f64| -> bool {
+                        self.world.is_walkable_step(
+                            me.pos,
+                            x + ux * 4.0,
+                            y + uy * 4.0,
+                            radius + 0.15,
+                            height,
+                            self.cfg.step_up,
+                            self.cfg.max_slope_deg,
+                        )
+                    };
+                    let make_u = |r_val: f64, s_val: f64| -> [f64; 2] {
+                        let vx = dirx * r_val - diry * s_val * 0.9;
+                        let vy = diry * r_val + dirx * s_val * 0.9;
+                        let vl = vx.hypot(vy).max(1e-4);
+                        [vx / vl, vy / vl]
+                    };
 
-                // Mid-fight cube scooping / weapon grab
-                let cube_thresh = if hp_frac > 0.5 { 70.0 } else { 40.0 };
-                if let Some(nc) = near_cube {
-                    if near_cube_d < cube_thresh {
-                        move_goal = Some([nc[0], nc[1]]);
-                    }
-                } else if let Some(np) = near_pick {
-                    if near_pick_d < if only_gun { 60.0 } else { 35.0 } {
-                        move_goal = Some([np[0], np[1]]);
+                    let c1 = make_u(radial, self.strafe_dir);
+                    if walk_ok(c1[0], c1[1]) {
+                        combat_mv = Some(c1);
+                    } else {
+                        let c2 = make_u(radial, -self.strafe_dir);
+                        if walk_ok(c2[0], c2[1]) {
+                            self.strafe_dir = -self.strafe_dir;
+                            self.strafe_until = t + 0.40;
+                            combat_mv = Some(c2);
+                        } else {
+                            // Wall directly behind us: slide laterally around the obstacle
+                            let l1 = [-diry * self.strafe_dir, dirx * self.strafe_dir];
+                            let l2 = [diry * self.strafe_dir, -dirx * self.strafe_dir];
+                            if walk_ok(l1[0], l1[1]) {
+                                combat_mv = Some(l1);
+                            } else if walk_ok(l2[0], l2[1]) {
+                                self.strafe_dir = -self.strafe_dir;
+                                self.strafe_until = t + 0.40;
+                                combat_mv = Some(l2);
+                            } else {
+                                combat_mv = Some(c1);
+                            }
+                        }
                     }
                 }
             }
 
             if zone_goal.is_some() && !me.in_zone {
                 move_goal = None;
+                combat_mv = None;
             }
         }
 
         // 7. Silent cover healing between waves
         let healing = move_goal.is_none()
+            && combat_mv.is_none()
             && target.is_none()
             && zone_goal.is_none()
             && active_drop.is_none()
@@ -704,7 +804,7 @@ impl BotBrain {
         }
 
         // 8. Zone rotation / Economy-first looting / Roaming
-        if move_goal.is_none() && !healing {
+        if move_goal.is_none() && combat_mv.is_none() && !healing {
             if let Some(zg) = zone_goal {
                 navigating = true;
                 high_prio_loot = true;
@@ -739,7 +839,8 @@ impl BotBrain {
                     }
                 }
 
-                // Supply drops (uncontested, reachable in time, safe in zone, ground-level)
+                // Supply drops (high value: cubes + instant repair; account for sprint speed)
+                let est_sprint_speed = (walk_speed * 1.25).max(14.0);
                 for dr in &obs.drops {
                     let gz = self.world.terrain_height(dr.pos[0], dr.pos[1]);
                     if (dr.pos[2] - gz).abs() > 2.5 {
@@ -749,14 +850,14 @@ impl BotBrain {
                         continue;
                     }
                     let d = (dr.pos[0] - x).hypot(dr.pos[1] - y);
-                    if d > 220.0 || dr.lands_in > d / walk_speed + 3.0 {
+                    if d > 260.0 || dr.lands_in > d / est_sprint_speed + 4.0 {
                         continue;
                     }
                     let zr = (dr.pos[0] - zn.next_center[0]).hypot(dr.pos[1] - zn.next_center[1]);
                     if zr > zn.next_radius && time_to_shrink < 15.0 {
                         continue;
                     }
-                    let sc = d - 80.0;
+                    let sc = d - 125.0;
                     if sc < bs {
                         bs = sc;
                         high_prio_loot = true;
@@ -858,12 +959,12 @@ impl BotBrain {
                                 .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
                         });
 
-                    let farm_tgt: Option<([f64; 3], [f64; 3], f64, bool)> = if let Some(n) = best_npc
-                    {
-                        Some((n.pos, n.vel, 1.75, false))
-                    } else {
-                        best_crate.map(|c| (c.pos, [0.0, 0.0, 0.0], 1.2, true))
-                    };
+                    let farm_tgt: Option<([f64; 3], [f64; 3], f64, bool)> =
+                        if let Some(n) = best_npc {
+                            Some((n.pos, n.vel, 1.75, false))
+                        } else {
+                            best_crate.map(|c| (c.pos, [0.0, 0.0, 0.0], 1.2, true))
+                        };
 
                     if let Some((fpos, fvel, fh, is_crate)) = farm_tgt {
                         let dd = (fpos[0] - x).hypot(fpos[1] - y);
@@ -906,9 +1007,11 @@ impl BotBrain {
             }
         }
 
-        // 9. Movement execution via 2 m Dijkstra flow-field
+        // 9. Movement execution: direct wall-safe combat vector OR 2 m Dijkstra flow-field
         let mut mv = [0.0_f64, 0.0_f64];
-        if let Some(mg) = move_goal {
+        if let Some(cmv) = combat_mv {
+            mv = cmv;
+        } else if let Some(mg) = move_goal {
             let gd = (mg[0] - x).hypot(mg[1] - y);
             if gd > 3.0 {
                 let gz = self.world.terrain_height(mg[0], mg[1]);
@@ -916,9 +1019,8 @@ impl BotBrain {
                     .world
                     .raycast_solid([x, y, z + 2.0], [mg[0], mg[1], gz + 2.0])
                     .is_none();
-                let check_ground = navigating
-                    && me.grounded
-                    && (z - self.world.terrain_height(x, y)).abs() < 2.0;
+                let check_ground =
+                    navigating && me.grounded && (z - self.world.terrain_height(x, y)).abs() < 2.0;
                 if direct
                     && gd < 60.0
                     && (!check_ground || self.nav.walk_segment(x, y, mg[0], mg[1]))
@@ -949,7 +1051,6 @@ impl BotBrain {
             let silent_scale = ((self.cfg.sound_step_speed - 0.35) / walk_speed).clamp(0.25, 1.0);
             mv = [mv[0] * silent_scale, mv[1] * silent_scale];
         } else if !in_fight && !healing && me.grounded && mv[0].hypot(mv[1]) > 0.5 {
-            // Out-of-combat economy sprinting (+67% travel speed while preserving combat energy)
             let sprint_thresh = if is_ffa {
                 72.0
             } else if high_prio_loot {
@@ -962,7 +1063,7 @@ impl BotBrain {
             }
         }
 
-        // 10. Iter 38 relative-velocity bullet, mortar, and laser dodge
+        // 10. Wall-safe relative-velocity bullet, mortar, and laser dodge
         let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
         let dodge_len = dodge[0].hypot(dodge[1]);
         if dodge_len > 0.05 {
@@ -1019,12 +1120,24 @@ impl BotBrain {
         }
         self.last_pos = [x, y, z];
 
-        // 12. Active idle scanning (fast 360° spawn sweep + forward weave)
+        // 12. Active idle scanning + front-armor facing toward recent pursuers
         if !want_aim {
+            let recent_pursuer = self
+                .belief
+                .tracks
+                .values()
+                .filter(|tr| t - tr.t < 4.5)
+                .min_by(|a, b| {
+                    (a.pos[0] - x)
+                        .hypot(a.pos[1] - y)
+                        .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                });
             if t < 3.0 {
                 aim_yaw = me.aim[0] + 1.6;
-            } else if t - self.belief.mech_hit_t < 2.0 {
+            } else if t - self.belief.mech_hit_t < 2.5 {
                 aim_yaw = self.belief.mech_hit_bearing;
+            } else if let Some(tr) = recent_pursuer {
+                aim_yaw = (tr.pos[1] - y).atan2(tr.pos[0] - x);
             } else if let Some(tb) = self.belief.threat_bearing {
                 if t - self.belief.threat_t < 3.0 {
                     aim_yaw = tb;

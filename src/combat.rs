@@ -257,15 +257,28 @@ pub fn solve_mortar(
     None
 }
 
-/// Iter 38 bullet/mortar/laser evasion: static + relative-velocity lead-shot detection,
+/// Wall-safe bullet/mortar/laser evasion: static + relative-velocity lead-shot detection,
 /// scaled mortar splash radius, and enemy laser-line perpendicular dodge.
 pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2], bool) {
     let pos = obs.me.pos;
     let my_vel = obs.me.vel;
-    let my_center = [pos[0], pos[1], pos[2] + 0.5 * obs.me.height()];
+    let height = obs.me.height();
+    let my_center = [pos[0], pos[1], pos[2] + 0.5 * height];
     let radius = obs.me.radius();
     let mut dodge = [0.0, 0.0];
     let mut urgent = false;
+
+    let step_ok = |ux: f64, uy: f64| -> bool {
+        world.is_walkable_step(
+            pos,
+            pos[0] + ux * 3.5,
+            pos[1] + uy * 3.5,
+            radius + 0.15,
+            height,
+            cfg.step_up,
+            cfg.max_slope_deg,
+        )
+    };
 
     for p in &obs.projectiles {
         if p.kind == "mortar" {
@@ -292,9 +305,18 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                     if d < danger_r && t_imp < 2.4 {
                         let ux = if d > 0.1 { dx / d } else { 1.0 };
                         let uy = if d > 0.1 { dy / d } else { 0.0 };
+                        let (fx, fy) = if step_ok(ux, uy) {
+                            (ux, uy)
+                        } else if step_ok(-uy, ux) {
+                            (-uy, ux)
+                        } else if step_ok(uy, -ux) {
+                            (uy, -ux)
+                        } else {
+                            (ux, uy)
+                        };
                         let w = (danger_r + 0.8 - d) * 0.9;
-                        dodge[0] += ux * w;
-                        dodge[1] += uy * w;
+                        dodge[0] += fx * w;
+                        dodge[1] += fy * w;
                         urgent = true;
                     }
                     break;
@@ -318,7 +340,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             let cz_stat = p.pos[2] + p.vel[2] * t_stat;
             let miss_d_stat = mx_stat.hypot(my_stat);
             let stat_threat = (0.0..=0.85).contains(&t_stat)
-                && (cz_stat - my_center[2]).abs() <= obs.me.height() * 0.65
+                && (cz_stat - my_center[2]).abs() <= height * 0.65
                 && miss_d_stat < thresh;
 
             let rvx = p.vel[0] - my_vel[0];
@@ -332,7 +354,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                 let my_zr = my_center[2] + my_vel[2] * tr;
                 let miss_r = mxr.hypot(myr);
                 let hit = (0.0..=0.85).contains(&tr)
-                    && (czr - my_zr).abs() <= obs.me.height() * 0.65
+                    && (czr - my_zr).abs() <= height * 0.65
                     && miss_r < thresh;
                 (hit, tr, mxr, myr)
             } else {
@@ -342,13 +364,16 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             if stat_threat || rel_threat {
                 let side_stat = mx_stat * px + my_stat * py;
                 let side_rel = mx_rel * px + my_rel * py;
-                let sign = if side_stat.abs() >= 0.4 {
+                let mut sign = if side_stat.abs() >= 0.4 {
                     if side_stat >= 0.0 { 1.0 } else { -1.0 }
                 } else if side_rel >= 0.0 {
                     1.0
                 } else {
                     -1.0
                 };
+                if !step_ok(px * sign, py * sign) && step_ok(-px * sign, -py * sign) {
+                    sign = -sign;
+                }
                 dodge[0] += px * sign * 3.4;
                 dodge[1] += py * sign * 3.4;
                 let t_hit = if rel_threat { t_rel } else { t_stat };
@@ -385,11 +410,14 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             let hlen = dir[0].hypot(dir[1]).max(1e-4);
             let side_x = -dir[1] / hlen;
             let side_y = dir[0] / hlen;
-            let sign = if (my_center[0] - px) * side_x + (my_center[1] - py) * side_y >= 0.0 {
+            let mut sign = if (my_center[0] - px) * side_x + (my_center[1] - py) * side_y >= 0.0 {
                 1.0
             } else {
                 -1.0
             };
+            if !step_ok(side_x * sign, side_y * sign) && step_ok(-side_x * sign, -side_y * sign) {
+                sign = -sign;
+            }
             dodge[0] += side_x * sign * 5.2;
             dodge[1] += side_y * sign * 5.2;
             urgent = true;
