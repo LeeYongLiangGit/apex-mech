@@ -33,6 +33,14 @@ pub struct RememberedNpc {
 }
 
 #[derive(Debug, Clone)]
+pub struct RememberedCrate {
+    pub id: u64,
+    pub pos: [f64; 3],
+    pub hp: f64,
+    pub t: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct RememberedCube {
     pub id: u64,
     pub pos: [f64; 3],
@@ -54,6 +62,7 @@ pub struct BeliefMap {
     pub tracks: HashMap<u32, TrackedMech>,
     pub attackers: HashMap<u32, f64>,
     pub npc_mem: HashMap<u32, RememberedNpc>,
+    pub crate_mem: HashMap<u64, RememberedCrate>,
     pub cube_mem: HashMap<u64, RememberedCube>,
     pub pick_mem: HashMap<u64, RememberedPickup>,
     pub last_damage_t: f64,
@@ -73,6 +82,7 @@ impl BeliefMap {
             tracks: HashMap::with_capacity(16),
             attackers: HashMap::with_capacity(16),
             npc_mem: HashMap::with_capacity(16),
+            crate_mem: HashMap::with_capacity(32),
             cube_mem: HashMap::with_capacity(32),
             pick_mem: HashMap::with_capacity(32),
             last_damage_t: -99.0,
@@ -159,6 +169,9 @@ impl BeliefMap {
                                 nm.hp -= amt;
                             }
                         }
+                        if let Some(cm) = self.crate_mem.get_mut(&tid) {
+                            cm.hp -= amt;
+                        }
                     }
                 }
                 "kill" => {
@@ -197,6 +210,42 @@ impl BeliefMap {
 
         // Expire stale NPCs
         self.npc_mem.retain(|_, nm| t - nm.t <= 25.0 && nm.hp > 0.0);
+
+        // Persistent ground crate memory (35 s TTL)
+        for cr in &obs.crates {
+            let gz = world.terrain_height(cr.pos[0], cr.pos[1]);
+            if (cr.pos[2] - gz).abs() > 2.0 {
+                continue;
+            }
+            self.crate_mem.insert(
+                cr.id,
+                RememberedCrate {
+                    id: cr.id,
+                    pos: cr.pos,
+                    hp: cr.hp,
+                    t,
+                },
+            );
+        }
+        self.crate_mem.retain(|_, c| {
+            if c.hp <= 0.0 || t - c.t > 35.0 {
+                return false;
+            }
+            if c.t == t {
+                return true;
+            }
+            let d = (c.pos[0] - x).hypot(c.pos[1] - y);
+            if d < 6.0 {
+                return false;
+            }
+            if d < 18.0 {
+                let pt = [c.pos[0], c.pos[1], c.pos[2] + 1.2];
+                if world.raycast_solid(my_eye, pt).is_none() {
+                    return false;
+                }
+            }
+            true
+        });
 
         // Ground cube memory (40 s TTL)
         for c in &obs.cubes {

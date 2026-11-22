@@ -10,7 +10,6 @@ use nav::NavEngine;
 use protocol::*;
 use std::f64::consts::PI;
 use std::io::{self, BufWriter, Write};
-use std::time::Instant;
 use world::World;
 
 const UPGRADE_PREF: &[&str] = &[
@@ -49,6 +48,13 @@ fn weapon_pref(kind: &str) -> f64 {
     }
 }
 
+struct CoverCache {
+    goal: [f64; 2],
+    path: Vec<[f64; 2]>,
+    tick: u64,
+    orig_los: usize,
+}
+
 struct BotBrain {
     cfg: RuleConfig,
     world: World,
@@ -63,6 +69,7 @@ struct BotBrain {
     hide_until: f64,
     target_id: Option<u32>,
     target_t: f64,
+    cover_cache: Option<CoverCache>,
 }
 
 impl BotBrain {
@@ -83,6 +90,7 @@ impl BotBrain {
             hide_until: 0.0,
             target_id: None,
             target_t: -99.0,
+            cover_cache: None,
         }
     }
 
@@ -166,8 +174,109 @@ impl BotBrain {
         }
     }
 
+    fn escape_vector(&self, x: f64, y: f64, now: f64) -> [f64; 2] {
+        let mut rx = 0.0;
+        let mut ry = 0.0;
+        for tr in self.belief.tracks.values() {
+            let age = (now - tr.t).max(0.0);
+            if age > 7.0 {
+                continue;
+            }
+            let dx = x - tr.pos[0];
+            let dy = y - tr.pos[1];
+            let d = dx.hypot(dy).max(4.0);
+            if d > 155.0 {
+                continue;
+            }
+            let w = (1.0 - age / 8.0) * (90.0 / d).min(3.5);
+            rx += (dx / d) * w;
+            ry += (dy / d) * w;
+        }
+        let len = rx.hypot(ry);
+        if len > 1e-4 {
+            [rx / len, ry / len]
+        } else {
+            [0.0, 0.0]
+        }
+    }
+
+    /// Cached path-verified 2 m BFS cover step around building corners (ready on tick 0).
+    fn get_bfs_cover_step(
+        &mut self,
+        obs: &ObsMsg,
+        threat_eyes: &[[f64; 3]],
+        escape_dir: [f64; 2],
+    ) -> Option<[f64; 2]> {
+        if threat_eyes.is_empty() {
+            self.cover_cache = None;
+            return None;
+        }
+        let [x, y, _] = obs.me.pos;
+        let eye_off = obs.me.eye_height();
+        let safe_r = (obs.zone.radius - 5.0).max(5.0);
+        let world = &self.world;
+        let los_at = |pt: [f64; 2]| -> usize {
+            let gz = world.terrain_height(pt[0], pt[1]);
+            let pt_eye = [pt[0], pt[1], gz + eye_off];
+            threat_eyes
+                .iter()
+                .filter(|&&te| world.raycast_solid(te, pt_eye).is_none())
+                .count()
+        };
+
+        let reuse_ok = self.cover_cache.as_ref().map_or(false, |cc| {
+            obs.tick.saturating_sub(cc.tick) < 6
+                && !cc.path.is_empty()
+                && (cc.goal[0] - x).hypot(cc.goal[1] - y) > 4.0
+                && (cc.goal[0] - obs.zone.center[0]).hypot(cc.goal[1] - obs.zone.center[1])
+                    <= safe_r
+                && los_at(cc.goal) <= cc.orig_los
+        });
+
+        if !reuse_ok {
+            self.cover_cache = self
+                .nav
+                .find_bfs_cover(
+                    x,
+                    y,
+                    eye_off,
+                    threat_eyes,
+                    escape_dir,
+                    obs.zone.center,
+                    obs.zone.radius,
+                    obs.zone.next_center,
+                    obs.zone.next_radius,
+                    &self.world,
+                )
+                .map(|(goal, path, orig_los)| CoverCache {
+                    goal,
+                    path,
+                    tick: obs.tick,
+                    orig_los,
+                });
+        }
+
+        let nav = &self.nav;
+        if let Some(cc) = self.cover_cache.as_mut() {
+            while cc.path.len() > 1
+                && (cc.path[0][0] - x).hypot(cc.path[0][1] - y) < 3.5
+            {
+                cc.path.remove(0);
+            }
+            let max_look = cc.path.len().min(8);
+            for idx in (1..max_look).rev() {
+                let wp = cc.path[idx];
+                if nav.walk_segment(x, y, wp[0], wp[1]) {
+                    return Some(wp);
+                }
+            }
+            cc.path.first().copied().or(Some(cc.goal))
+        } else {
+            None
+        }
+    }
+
     fn decide(&mut self, obs: &ObsMsg) -> Action {
-        let tick_t0 = Instant::now();
         self.belief.update(obs, &self.world);
 
         let me = &obs.me;
@@ -176,11 +285,11 @@ impl BotBrain {
         let radius = me.radius();
         let height = me.height();
         let muzzle_z = z + me.muzzle_height();
-        let eye_off = me.eye_height();
         let muzzle = [x, y, muzzle_z];
         let turn_rate = me.turn_rate();
         let pitch_rate = me.stat_f64("pitch_rate", 3.0);
         let hp_frac = me.hp / me.max_hp.max(1.0);
+        let big_mech = me.cubes >= 6;
         let cube_mult =
             1.0 + self.cfg.cube_damage_per_cube * (me.cubes.min(self.cfg.cube_stat_cap) as f64);
 
@@ -191,7 +300,7 @@ impl BotBrain {
             act.pick = Some(self.pick_upgrade(offer, obs));
         }
 
-        // 2. Held weapon slots
+        // 2. Held weapon slots & incoming dodge / heavy threats
         let find_slot = |k: &str| -> Option<(usize, &WeaponSlot)> {
             me.weapons
                 .iter()
@@ -204,6 +313,9 @@ impl BotBrain {
         let light_slot = find_slot("lightning");
         let mortar_slot = find_slot("mortar");
         let only_gun = me.weapons.iter().take(2).any(|w| w.is_none());
+
+        let (dodge, urgent_dodge, heavy_threat) = compute_dodge(obs, &self.cfg, &self.world);
+        let dodge_len = dodge[0].hypot(dodge[1]);
 
         // 3. Nearest wanted pickup & cube from persistent memory
         let mut near_pick: Option<[f64; 3]> = None;
@@ -326,16 +438,30 @@ impl BotBrain {
             self.target_t = t;
         }
 
-        // Count active nearby threats & collect their eye positions for cover checks
+        // Active threats & secondary-enemy repulsion vector
         let mut threats = 0_usize;
         let mut active_threat_eyes: Vec<[f64; 3]> = Vec::with_capacity(6);
+        let mut sec_repel = [0.0_f64, 0.0_f64];
+        let primary_id = target.as_ref().map(|(tr, _, _)| tr.id);
         for tr in self.belief.tracks.values() {
-            if t - tr.t < 3.0 && (tr.pos[0] - x).hypot(tr.pos[1] - y) < 160.0 {
+            let d = (tr.pos[0] - x).hypot(tr.pos[1] - y);
+            if t - tr.t < 3.0 && d < 160.0 {
                 threats += 1;
                 let h = 9.0 * (1.0 + self.cfg.cube_size_per_cube * tr.cubes as f64);
                 active_threat_eyes.push([tr.pos[0], tr.pos[1], tr.pos[2] + 0.78 * h]);
+                if Some(tr.id) != primary_id && d < 120.0 {
+                    let w = (80.0 / d.max(8.0)).min(2.0);
+                    sec_repel[0] += ((x - tr.pos[0]) / d.max(1.0)) * w;
+                    sec_repel[1] += ((y - tr.pos[1]) / d.max(1.0)) * w;
+                }
             }
         }
+        let sec_len = sec_repel[0].hypot(sec_repel[1]);
+        if sec_len > 1e-4 {
+            sec_repel[0] /= sec_len;
+            sec_repel[1] /= sec_len;
+        }
+        let escape_dir = self.escape_vector(x, y, t);
 
         // 5. Zone rotation goal (near-edge, travel-time triggered)
         let zn = &obs.zone;
@@ -369,7 +495,7 @@ impl BotBrain {
                     return false;
                 }
                 let d = (dr.pos[0] - x).hypot(dr.pos[1] - y);
-                dr.holder == Some(me.id) || (d <= dr.radius + 6.0 && dr.lands_in <= 2.5)
+                dr.holder == Some(me.id) || (d <= dr.radius + 12.0 && dr.lands_in <= 3.0)
             })
         } else {
             None
@@ -378,6 +504,7 @@ impl BotBrain {
         // 6. Combat & macro decision
         let mut move_goal: Option<[f64; 2]> = None;
         let mut combat_mv: Option<[f64; 2]> = None;
+        let mut using_bfs_cover = false;
         let mut aim_yaw = me.aim[0];
         let mut aim_pitch = 0.0_f64;
         let mut want_aim = false;
@@ -414,12 +541,15 @@ impl BotBrain {
                 self.hide_until = t + 6.0;
             }
 
-            let instant_aim = aim_to(muzzle, *aim_pt);
+            let short_lead_pt = [
+                aim_pt[0] + tr.vel[0] * 0.05,
+                aim_pt[1] + tr.vel[1] * 0.05,
+                aim_pt[2] + tr.vel[2] * 0.05,
+            ];
+            let instant_aim = aim_to(muzzle, short_lead_pt);
             let gun_speed = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
             let gun_lead = lead_aim(muzzle, *aim_pt, tr.vel, age, gun_speed, &self.world);
 
-            // Snap to instant_aim only during the final 0.20 s of Laser charge (or lethal release)
-            // so Arm Gun keeps firing full DPS throughout the first ~0.55 s of every Laser charge!
             let laser_snap_aim = !losing
                 && laser_slot.map_or(false, |(_, lw)| {
                     if lw.charge <= 0.0 {
@@ -440,8 +570,8 @@ impl BotBrain {
                         || lw.charge >= full + hold_s - 0.35
                 });
 
-            let gun_ready_to_shoot = gun_slot
-                .map_or(false, |(_, gw)| gw.reload <= 0.0 && gw.ammo != Some(0));
+            let gun_ready_to_shoot =
+                gun_slot.map_or(false, |(_, gw)| gw.reload <= 0.0 && gw.ammo != Some(0));
 
             let chosen_aim = if let Some((_, lw)) = light_slot {
                 let l_range = lw.stat_f64("range", 45.0);
@@ -474,7 +604,6 @@ impl BotBrain {
             let tol = (2.2 * t_scale).atan2(d.max(1.0));
 
             if seen && *has_los {
-                // Arm Gun (fires freely during early Laser charge & inside Lightning cone)
                 if let Some((gi, gw)) = gun_slot {
                     let g_range = gw.stat_f64("range", 230.0);
                     if gw.reload <= 0.0 && gw.ammo == Some(0) {
@@ -497,7 +626,6 @@ impl BotBrain {
                     }
                 }
 
-                // Lightning
                 if let Some((li, lw)) = light_slot {
                     let l_range = lw.stat_f64("range", 45.0);
                     let l_cone = lw.stat_f64("cone_deg", 30.0).to_radians() * 0.47;
@@ -509,7 +637,7 @@ impl BotBrain {
                 }
             }
 
-            // Laser: charge when not losing; release cleanly on full, lethal, or retreat abort
+            // Laser: charge on LOS or verified corner peek; release on full, lethal, retreat, or heavy dodge
             if let Some((li, lw)) = laser_slot {
                 laser_handled = true;
                 let range = lw.stat_f64("range", 280.0);
@@ -546,19 +674,25 @@ impl BotBrain {
                         && cur_pitch_err < tol * 1.5 + 0.02
                         && beam_clear;
                     let hold_expired = ch >= full + hold_s - 0.20;
+                    let abort_for_dodge = heavy_threat && ch < full - 0.12;
 
-                    if (ready && aligned) || hold_expired || losing {
+                    if (ready && aligned) || hold_expired || losing || abort_for_dodge {
                         act.fire[li] = false;
                     } else {
                         act.fire[li] = true;
                     }
-                } else if !losing
-                    && lw.cooldown <= 0.05
-                    && seen
-                    && d < range
-                    && (*has_los || d < 60.0)
-                {
-                    act.fire[li] = true;
+                } else if !losing && !heavy_threat && lw.cooldown <= 0.05 && d < range {
+                    let enemy_peeking_soon = !*has_los && age <= 1.0 && d <= 140.0 && {
+                        let pred_t = [
+                            aim_pt[0] + tr.vel[0] * 0.55,
+                            aim_pt[1] + tr.vel[1] * 0.55,
+                            aim_pt[2],
+                        ];
+                        self.world.raycast_solid(muzzle, pred_t).is_none()
+                    };
+                    if (seen && *has_los) || enemy_peeking_soon {
+                        act.fire[li] = true;
+                    }
                 }
             }
 
@@ -592,7 +726,7 @@ impl BotBrain {
                 }
             }
 
-            // Combat movement, Laser kiting, wall-safe strafing, or drop holding
+            // Combat movement, BFS cover retreat, Laser kiting, or drop holding
             let prefer = if let Some((_, lw)) = light_slot {
                 (lw.stat_f64("range", 45.0) - 10.0).max(26.0)
             } else if laser_slot.is_some() {
@@ -603,29 +737,27 @@ impl BotBrain {
 
             let hold_drop_in_fight = active_drop.filter(|dr| {
                 !losing
-                    && ((!*has_los || d > 52.0)
+                    && ((!*has_los || d > 48.0)
                         || (dr.progress >= dr.capture_s - 1.5 && hp_frac > 0.35))
             });
 
             if losing {
-                let primary_eye = [tp[0], tp[1], tp[2] + 8.0 * t_scale];
-                if let Some(cov) = self.nav.cover_from(
-                    x,
-                    y,
-                    eye_off,
-                    &active_threat_eyes,
-                    primary_eye,
-                    50.0,
-                    zn.center,
-                    zn.radius,
-                    &self.world,
-                ) {
-                    move_goal = Some(cov);
+                let retreat_threats = if !active_threat_eyes.is_empty() {
+                    active_threat_eyes.clone()
                 } else {
-                    move_goal = Some([x - (tp[0] - x), y - (tp[1] - y)]);
+                    vec![[tp[0], tp[1], tp[2] + 8.0 * t_scale]]
+                };
+                if let Some(step_wp) =
+                    self.get_bfs_cover_step(obs, &retreat_threats, escape_dir)
+                {
+                    move_goal = Some(step_wp);
+                    using_bfs_cover = true;
+                } else {
+                    move_goal = Some([x + escape_dir[0] * 14.0, y + escape_dir[1] * 14.0]);
                 }
                 boost = me.energy > 15.0;
             } else if let Some(dr) = hold_drop_in_fight {
+                self.cover_cache = None;
                 let dd = (dr.pos[0] - x).hypot(dr.pos[1] - y);
                 let inner_r = (dr.radius - 3.0).max(2.0);
                 if dd > inner_r {
@@ -646,6 +778,7 @@ impl BotBrain {
                     }
                 }
             } else {
+                self.cover_cache = None;
                 let dirx = (tp[0] - x) / d.max(1.0);
                 let diry = (tp[1] - y) / d.max(1.0);
                 let enemy_lightning = tr.weapons.iter().any(|w| w == "lightning");
@@ -684,7 +817,6 @@ impl BotBrain {
                     self.strafe_until = t + 0.28 + self.next_rng() * 0.37;
                 }
 
-                // Boost-strafe when target aims a charging laser at us
                 if tr.charging {
                     let to_me = (y - tp[1]).atan2(x - tp[0]);
                     if angle_diff(tr.aim[0], to_me).abs() < 0.25 {
@@ -692,7 +824,6 @@ impl BotBrain {
                     }
                 }
 
-                // Mid-fight cube scooping / weapon grab (FIXED: falls through to near_pick!)
                 let cube_thresh = if hp_frac > 0.5 { 68.0 } else { 38.0 };
                 let pick_thresh = if only_gun { 65.0 } else { 40.0 };
                 if let Some(nc) = near_cube.filter(|_| near_cube_d < cube_thresh) {
@@ -700,21 +831,9 @@ impl BotBrain {
                 } else if let Some(np) = near_pick.filter(|_| near_pick_d < pick_thresh) {
                     move_goal = Some([np[0], np[1]]);
                 } else if radial > 0.0 && !*has_los {
-                    self.nav.field(tp[0], tp[1]);
-                    self.nav.pump(5.0, 120_000);
-                    if self.nav.field_for(tp[0], tp[1], 30.0) {
-                        if let Some(st) = self.nav.steer(x, y) {
-                            let fx = st[0] - diry * self.strafe_dir * 0.3;
-                            let fy = st[1] + dirx * self.strafe_dir * 0.3;
-                            let fl = fx.hypot(fy).max(1e-4);
-                            combat_mv = Some([fx / fl, fy / fl]);
-                        }
-                    }
-                    if combat_mv.is_none() {
-                        move_goal = Some([tp[0], tp[1]]);
-                    }
+                    move_goal = Some([tp[0], tp[1]]);
                 } else {
-                    // Wall-safe continuous strafe/kite vector (avoids thrashing nav.field)
+                    // Wall-safe continuous strafe/kite vector with gentle secondary-flank drift
                     let walk_ok = |ux: f64, uy: f64| -> bool {
                         self.world.is_walkable_step(
                             me.pos,
@@ -726,9 +845,10 @@ impl BotBrain {
                             self.cfg.max_slope_deg,
                         )
                     };
+                    let flank_w = if threats >= 2 && sec_len > 0.1 { 0.38 } else { 0.0 };
                     let make_u = |r_val: f64, s_val: f64| -> [f64; 2] {
-                        let vx = dirx * r_val - diry * s_val * 0.9;
-                        let vy = diry * r_val + dirx * s_val * 0.9;
+                        let vx = dirx * r_val - diry * s_val * 0.9 + sec_repel[0] * flank_w;
+                        let vy = diry * r_val + dirx * s_val * 0.9 + sec_repel[1] * flank_w;
                         let vl = vx.hypot(vy).max(1e-4);
                         [vx / vl, vy / vl]
                     };
@@ -743,7 +863,6 @@ impl BotBrain {
                             self.strafe_until = t + 0.40;
                             combat_mv = Some(c2);
                         } else {
-                            // Wall directly behind us: slide laterally around the obstacle
                             let l1 = [-diry * self.strafe_dir, dirx * self.strafe_dir];
                             let l2 = [diry * self.strafe_dir, -dirx * self.strafe_dir];
                             if walk_ok(l1[0], l1[1]) {
@@ -763,10 +882,11 @@ impl BotBrain {
             if zone_goal.is_some() && !me.in_zone {
                 move_goal = None;
                 combat_mv = None;
+                using_bfs_cover = false;
             }
         }
 
-        // 7. Silent cover healing between waves
+        // 7. Active cover-healing between waves (maintains separation behind cover so regen finishes)
         let healing = move_goal.is_none()
             && combat_mv.is_none()
             && target.is_none()
@@ -780,30 +900,38 @@ impl BotBrain {
                 .belief
                 .tracks
                 .values()
-                .max_by(|a, b| a.t.total_cmp(&b.t))
+                .filter(|tr| t - tr.t < 8.0)
+                .min_by(|a, b| {
+                    (a.pos[0] - x)
+                        .hypot(a.pos[1] - y)
+                        .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                })
             {
+                let l_dist = (last_tr.pos[0] - x).hypot(last_tr.pos[1] - y);
                 let l_eye = [last_tr.pos[0], last_tr.pos[1], last_tr.pos[2] + 8.0];
                 let my_body = [x, y, z + 6.0];
-                if self.world.raycast_solid(l_eye, my_body).is_none() {
-                    if let Some(cov) = self.nav.cover_from(
-                        x,
-                        y,
-                        eye_off,
-                        &active_threat_eyes,
-                        l_eye,
-                        36.0,
-                        zn.center,
-                        zn.radius,
-                        &self.world,
-                    ) {
-                        move_goal = Some(cov);
-                        slow = true;
+                let exposed = self.world.raycast_solid(l_eye, my_body).is_none();
+                // Keep moving behind cover if exposed OR if pursuer is close enough to round our corner
+                if exposed || l_dist < 45.0 {
+                    let heal_threats = if !active_threat_eyes.is_empty() {
+                        active_threat_eyes.clone()
+                    } else {
+                        vec![l_eye]
+                    };
+                    if let Some(step_wp) =
+                        self.get_bfs_cover_step(obs, &heal_threats, escape_dir)
+                    {
+                        move_goal = Some(step_wp);
+                        using_bfs_cover = true;
+                        slow = !exposed && l_dist > 30.0;
                     }
                 }
             }
+        } else if !is_losing {
+            self.cover_cache = None;
         }
 
-        // 8. Zone rotation / Economy-first looting / Roaming
+        // 8. Zone rotation / Economy-first looting / Safe cover-anchored roaming
         if move_goal.is_none() && combat_mv.is_none() && !healing {
             if let Some(zg) = zone_goal {
                 navigating = true;
@@ -815,7 +943,6 @@ impl BotBrain {
                 let mut best: Option<[f64; 2]> = None;
                 let mut bs = f64::INFINITY;
 
-                // Ground weapon pickups
                 for p in self.belief.pick_mem.values() {
                     if self.want_kind(obs, &p.kind).is_none() {
                         continue;
@@ -829,7 +956,6 @@ impl BotBrain {
                     }
                 }
 
-                // Ground loose cubes (uncapped)
                 for c in self.belief.cube_mem.values() {
                     let s = (c.pos[0] - x).hypot(c.pos[1] - y) - 30.0;
                     if s < bs {
@@ -839,7 +965,6 @@ impl BotBrain {
                     }
                 }
 
-                // Supply drops (high value: cubes + instant repair; account for sprint speed)
                 let est_sprint_speed = (walk_speed * 1.25).max(14.0);
                 for dr in &obs.drops {
                     let gz = self.world.terrain_height(dr.pos[0], dr.pos[1]);
@@ -869,7 +994,6 @@ impl BotBrain {
                     }
                 }
 
-                // Remembered NPC drones (uncapped)
                 if hp_frac > 0.50 {
                     for nm in self.belief.npc_mem.values() {
                         let d = (nm.pos[0] - x).hypot(nm.pos[1] - y);
@@ -880,22 +1004,24 @@ impl BotBrain {
                         if sc < bs {
                             bs = sc;
                             high_prio_loot = false;
-                            best = Some(if d > 38.0 {
-                                [nm.pos[0], nm.pos[1]]
+                            if d > 36.0 {
+                                best = Some([nm.pos[0], nm.pos[1]]);
                             } else {
-                                [x, y]
-                            });
+                                // Strafe gently around drone instead of standing still eating plasma
+                                let dirx = (nm.pos[0] - x) / d.max(1.0);
+                                let diry = (nm.pos[1] - y) / d.max(1.0);
+                                best = Some([
+                                    x - diry * self.strafe_dir * 6.0,
+                                    y + dirx * self.strafe_dir * 6.0,
+                                ]);
+                            }
                         }
                     }
                 }
 
-                // Ground crates (uncapped)
+                // Persistent ground crates (never forgotten when turning)
                 if hp_frac > 0.45 {
-                    for c in &obs.crates {
-                        let gz = self.world.terrain_height(c.pos[0], c.pos[1]);
-                        if (c.pos[2] - gz).abs() > 2.0 {
-                            continue;
-                        }
+                    for c in self.belief.crate_mem.values() {
                         let d = (c.pos[0] - x).hypot(c.pos[1] - y);
                         if d > 150.0 {
                             continue;
@@ -915,6 +1041,14 @@ impl BotBrain {
 
                 if let Some(bg) = best {
                     move_goal = Some(bg);
+                } else if let Some(anchor) = self.nav.find_cover_anchor(
+                    x,
+                    y,
+                    zn.next_center,
+                    zn.next_radius,
+                    85.0,
+                ) {
+                    move_goal = Some(anchor);
                 } else {
                     let ang = (y - zn.next_center[1]).atan2(x - zn.next_center[0]);
                     let r = (zn.next_radius * 0.6).min((d_next - 30.0).max(20.0));
@@ -923,97 +1057,94 @@ impl BotBrain {
                         zn.next_center[1] + ang.sin() * r,
                     ]);
                 }
+            }
+        }
 
-                // Shoot visible NPCs / crates when safe
-                let unseen_attacker = t - self.belief.mech_hit_t < 1.5;
-                if hp_frac > 0.40 && !unseen_attacker {
-                    let best_npc = obs
-                        .mechs
-                        .iter()
-                        .filter(|m| {
-                            m.kind == "npc"
-                                && (m.pos[0] - x).hypot(m.pos[1] - y) < 110.0
-                                && self
-                                    .world
-                                    .raycast_solid(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 1.75])
-                                    .is_none()
-                        })
-                        .min_by(|a, b| {
-                            (a.pos[0] - x)
-                                .hypot(a.pos[1] - y)
-                                .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
-                        });
-                    let best_crate = obs
-                        .crates
-                        .iter()
-                        .filter(|c| {
-                            (c.pos[0] - x).hypot(c.pos[1] - y) < 120.0
-                                && self
-                                    .world
-                                    .raycast_solid(muzzle, [c.pos[0], c.pos[1], c.pos[2] + 1.2])
-                                    .is_none()
-                        })
-                        .min_by(|a, b| {
-                            (a.pos[0] - x)
-                                .hypot(a.pos[1] - y)
-                                .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
-                        });
+        // Shoot visible NPCs / crates whenever out of mech fight (even while rotating to zone!)
+        if !in_fight && !healing {
+            let unseen_attacker = t - self.belief.mech_hit_t < 1.5;
+            if hp_frac > 0.40 && !unseen_attacker {
+                let best_npc = obs
+                    .mechs
+                    .iter()
+                    .filter(|m| {
+                        m.kind == "npc"
+                            && (m.pos[0] - x).hypot(m.pos[1] - y) < 110.0
+                            && self
+                                .world
+                                .raycast_solid(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 1.75])
+                                .is_none()
+                    })
+                    .min_by(|a, b| {
+                        (a.pos[0] - x)
+                            .hypot(a.pos[1] - y)
+                            .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                    });
+                let best_crate = obs
+                    .crates
+                    .iter()
+                    .filter(|c| {
+                        (c.pos[0] - x).hypot(c.pos[1] - y) < 120.0
+                            && self
+                                .world
+                                .raycast_solid(muzzle, [c.pos[0], c.pos[1], c.pos[2] + 1.2])
+                                .is_none()
+                    })
+                    .min_by(|a, b| {
+                        (a.pos[0] - x)
+                            .hypot(a.pos[1] - y)
+                            .total_cmp(&(b.pos[0] - x).hypot(b.pos[1] - y))
+                    });
 
-                    let farm_tgt: Option<([f64; 3], [f64; 3], f64, bool)> =
-                        if let Some(n) = best_npc {
-                            Some((n.pos, n.vel, 1.75, false))
-                        } else {
-                            best_crate.map(|c| (c.pos, [0.0, 0.0, 0.0], 1.2, true))
-                        };
+                let farm_tgt: Option<([f64; 3], [f64; 3], f64, bool)> = if let Some(n) = best_npc {
+                    Some((n.pos, n.vel, 1.75, false))
+                } else {
+                    best_crate.map(|c| (c.pos, [0.0, 0.0, 0.0], 1.2, true))
+                };
 
-                    if let Some((fpos, fvel, fh, is_crate)) = farm_tgt {
-                        let dd = (fpos[0] - x).hypot(fpos[1] - y);
-                        let g_spd = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
-                        let tt = dd / g_spd.max(1.0);
-                        let px = fpos[0] + fvel[0] * tt;
-                        let py = fpos[1] + fvel[1] * tt;
-                        aim_yaw = (py - y).atan2(px - x);
-                        aim_pitch = (fpos[2] + fh - muzzle_z).atan2(dd.max(1e-4));
-                        want_aim = true;
+                if let Some((fpos, fvel, fh, is_crate)) = farm_tgt {
+                    let dd = (fpos[0] - x).hypot(fpos[1] - y);
+                    let g_spd = gun_slot.map_or(252.0, |(_, g)| g.stat_f64("speed", 252.0));
+                    let tt = dd / g_spd.max(1.0);
+                    let px = fpos[0] + fvel[0] * tt;
+                    let py = fpos[1] + fvel[1] * tt;
+                    aim_yaw = (py - y).atan2(px - x);
+                    aim_pitch = (fpos[2] + fh - muzzle_z).atan2(dd.max(1e-4));
+                    want_aim = true;
 
-                        let pred = predict_aim_after_step(
-                            me.aim,
-                            [aim_yaw, aim_pitch],
-                            turn_rate,
-                            pitch_rate,
-                        );
-                        let tol = 1.3_f64.atan2(dd.max(1.0));
-                        if angle_diff(pred[0], aim_yaw).abs() < tol
-                            && (pred[1] - aim_pitch).abs() < tol * 2.0 + 0.02
-                        {
-                            if let Some((gi, gw)) = gun_slot {
-                                if gw.reload <= 0.0 {
-                                    act.fire[gi] = true;
-                                }
-                            }
-                            if let Some((li, lw)) = light_slot {
-                                let l_rng = lw.stat_f64("range", 45.0);
-                                let l_eng = lw.stat_f64("energy", 3.0);
-                                if dd < l_rng - 3.0 && me.energy > l_eng + 2.0 {
-                                    act.fire[li] = true;
-                                }
+                    let pred =
+                        predict_aim_after_step(me.aim, [aim_yaw, aim_pitch], turn_rate, pitch_rate);
+                    let tol = 1.3_f64.atan2(dd.max(1.0));
+                    if angle_diff(pred[0], aim_yaw).abs() < tol
+                        && (pred[1] - aim_pitch).abs() < tol * 2.0 + 0.02
+                    {
+                        if let Some((gi, gw)) = gun_slot {
+                            if gw.reload <= 0.0 {
+                                act.fire[gi] = true;
                             }
                         }
-                        if is_crate && dd < 25.0 && active_drop.is_none() {
-                            move_goal = Some([fpos[0], fpos[1]]);
+                        if let Some((li, lw)) = light_slot {
+                            let l_rng = lw.stat_f64("range", 45.0);
+                            let l_eng = lw.stat_f64("energy", 3.0);
+                            if dd < l_rng - 3.0 && me.energy > l_eng + 2.0 {
+                                act.fire[li] = true;
+                            }
                         }
+                    }
+                    if is_crate && dd < 25.0 && active_drop.is_none() && zone_goal.is_none() {
+                        move_goal = Some([fpos[0], fpos[1]]);
                     }
                 }
             }
         }
 
-        // 9. Movement execution: direct wall-safe combat vector OR 2 m Dijkstra flow-field
+        // 9. Movement execution: direct wall-safe combat vector, BFS cover step, or instant 2 m A*
         let mut mv = [0.0_f64, 0.0_f64];
         if let Some(cmv) = combat_mv {
             mv = cmv;
         } else if let Some(mg) = move_goal {
             let gd = (mg[0] - x).hypot(mg[1] - y);
-            if gd > 3.0 {
+            if gd > 2.5 {
                 let gz = self.world.terrain_height(mg[0], mg[1]);
                 let direct = self
                     .world
@@ -1021,20 +1152,23 @@ impl BotBrain {
                     .is_none();
                 let check_ground =
                     navigating && me.grounded && (z - self.world.terrain_height(x, y)).abs() < 2.0;
-                if direct
+                if using_bfs_cover {
+                    mv = [(mg[0] - x) / gd, (mg[1] - y) / gd];
+                } else if direct
                     && gd < 60.0
                     && (!check_ground || self.nav.walk_segment(x, y, mg[0], mg[1]))
                 {
                     mv = [(mg[0] - x) / gd, (mg[1] - y) / gd];
                 } else {
-                    self.nav.field(mg[0], mg[1]);
-                    self.nav.pump(6.0, 140_000);
-                    let st = if self.nav.field_for(mg[0], mg[1], 25.0) {
-                        self.nav.steer(x, y)
+                    let wp = self.nav.next_waypoint(obs.tick, x, y, mg, big_mech);
+                    let wdx = wp[0] - x;
+                    let wdy = wp[1] - y;
+                    let wd = wdx.hypot(wdy);
+                    if wd > 0.25 {
+                        mv = [wdx / wd, wdy / wd];
                     } else {
-                        None
-                    };
-                    mv = st.unwrap_or([(mg[0] - x) / gd, (mg[1] - y) / gd]);
+                        mv = [(mg[0] - x) / gd, (mg[1] - y) / gd];
+                    }
                 }
             }
         }
@@ -1064,8 +1198,6 @@ impl BotBrain {
         }
 
         // 10. Wall-safe relative-velocity bullet, mortar, and laser dodge
-        let (dodge, urgent_dodge) = compute_dodge(obs, &self.cfg, &self.world);
-        let dodge_len = dodge[0].hypot(dodge[1]);
         if dodge_len > 0.05 {
             let dx = dodge[0] / dodge_len;
             let dy = dodge[1] / dodge_len;
@@ -1074,15 +1206,17 @@ impl BotBrain {
             if ml > 1.0 {
                 mv = [mv[0] / ml, mv[1] / ml];
             }
-            let min_e = if light_slot.is_some() && target.is_some() {
-                55.0
-            } else if urgent_dodge {
-                15.0
-            } else {
-                25.0
-            };
-            if me.energy > min_e {
-                boost = true;
+            if urgent_dodge || heavy_threat {
+                let min_e = if heavy_threat {
+                    8.0
+                } else if light_slot.is_some() && target.is_some() {
+                    50.0
+                } else {
+                    18.0
+                };
+                if me.energy > min_e {
+                    boost = true;
+                }
             }
         }
 
@@ -1106,6 +1240,7 @@ impl BotBrain {
             self.stuck_t = 0.0;
         }
         if self.stuck_t > 0.6 {
+            self.nav.invalidate_cache();
             jump = true;
             boost = me.energy > 10.0;
             if self.stuck_t > 2.5 {
@@ -1158,8 +1293,14 @@ impl BotBrain {
             aim_pitch = 0.0;
         }
 
-        // Keep laser charging ONLY across brief target blinks when not handled/retreating/healing
-        if !laser_handled && !is_losing && !healing && me.in_zone && (t - self.target_t) <= 0.6 {
+        // Keep laser charging ONLY across brief target blinks when not handled/retreating/healing/dodging
+        if !laser_handled
+            && !is_losing
+            && !healing
+            && !heavy_threat
+            && me.in_zone
+            && (t - self.target_t) <= 0.6
+        {
             if let Some((li, lw)) = laser_slot {
                 if laser_charging && lw.charge < lw.stat_f64("charge", 0.75) - 0.05 {
                     act.fire[li] = true;
@@ -1184,15 +1325,6 @@ impl BotBrain {
         act.boost = boost && !laser_holding;
         act.jump = jump;
         act.sanitize(self.cfg.min_pitch, self.cfg.max_pitch);
-
-        // Spend remaining small budget finishing any pending flow field
-        if self.nav.is_pending() {
-            let elapsed_ms = tick_t0.elapsed().as_secs_f64() * 1000.0;
-            let rem = (12.0 - elapsed_ms).max(0.0);
-            if rem > 0.5 {
-                self.nav.pump(rem, 120_000);
-            }
-        }
 
         act
     }

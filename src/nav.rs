@@ -1,8 +1,36 @@
 use crate::world::World;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::f64::consts::PI;
-use std::time::Instant;
 
 const INF: f32 = 1e9;
+
+#[derive(Clone, Copy)]
+struct HeapNode {
+    f: f32,
+    idx: usize,
+}
+
+impl PartialEq for HeapNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.f.to_bits() == other.f.to_bits() && self.idx == other.idx
+    }
+}
+impl Eq for HeapNode {}
+
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .f
+            .total_cmp(&self.f)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub struct NavEngine {
     min_x: f64,
@@ -10,14 +38,15 @@ pub struct NavEngine {
     nnx: usize,
     nny: usize,
     walk: Vec<u8>,
-    dist: Vec<f32>,
-    work: Vec<f32>,
-    hk: Vec<f32>,
-    hv: Vec<u32>,
-    goal_key: Option<(i32, i32)>,
-    pending_key: Option<(i32, i32)>,
-    pending_goal: [f64; 2],
-    ready_goal: Option<[f64; 2]>,
+    near_cover: Vec<u8>,
+    tight: Vec<u8>,
+    g_score: Vec<f32>,
+    parent: Vec<u32>,
+    stamp: Vec<u32>,
+    cur_stamp: u32,
+    cached_goal: [f64; 2],
+    cached_path: Vec<[f64; 2]>,
+    last_plan_tick: u64,
 }
 
 impl NavEngine {
@@ -134,21 +163,61 @@ impl NavEngine {
             }
         }
 
+        let mut near_cover = vec![0_u8; total];
+        let mut tight = vec![0_u8; total];
+        if nnx > 6 && nny > 6 {
+            for jj in 3..(nny - 3) {
+                for ii in 3..(nnx - 3) {
+                    let k = jj * nnx + ii;
+                    if walk[k] == 0 {
+                        continue;
+                    }
+                    let mut adj1 = false;
+                    let mut adj2 = false;
+                    for dj in -2_isize..=2 {
+                        for di in -2_isize..=2 {
+                            if di == 0 && dj == 0 {
+                                continue;
+                            }
+                            let nk = (jj as isize + dj) as usize * nnx + (ii as isize + di) as usize;
+                            if walk[nk] == 0 {
+                                adj2 = true;
+                                if di.abs() <= 1 && dj.abs() <= 1 {
+                                    adj1 = true;
+                                }
+                            }
+                        }
+                    }
+                    if adj1 {
+                        tight[k] = 1;
+                    }
+                    if adj2 {
+                        near_cover[k] = 1;
+                    }
+                }
+            }
+        }
+
         Self {
             min_x,
             min_y,
             nnx,
             nny,
             walk,
-            dist: vec![INF; total],
-            work: vec![INF; total],
-            hk: Vec::with_capacity(total),
-            hv: Vec::with_capacity(total),
-            goal_key: None,
-            pending_key: None,
-            pending_goal: [0.0, 0.0],
-            ready_goal: None,
+            near_cover,
+            tight,
+            g_score: vec![INF; total],
+            parent: vec![u32::MAX; total],
+            stamp: vec![0; total],
+            cur_stamp: 0,
+            cached_goal: [0.0, 0.0],
+            cached_path: Vec::new(),
+            last_plan_tick: 0,
         }
+    }
+
+    pub fn invalidate_cache(&mut self) {
+        self.cached_path.clear();
     }
 
     #[inline]
@@ -158,6 +227,56 @@ impl NavEngine {
         let j = (((y - self.min_y) * 0.5).round() as isize)
             .clamp(0, self.nny as isize - 1) as usize;
         j * self.nnx + i
+    }
+
+    #[inline]
+    fn cell_world(&self, idx: usize) -> [f64; 2] {
+        let i = idx % self.nnx;
+        let j = idx / self.nnx;
+        [self.min_x + (i as f64) * 2.0, self.min_y + (j as f64) * 2.0]
+    }
+
+    #[inline]
+    fn next_stamp(&mut self) -> u32 {
+        self.cur_stamp = self.cur_stamp.wrapping_add(1);
+        if self.cur_stamp == 0 {
+            self.stamp.fill(0);
+            self.cur_stamp = 1;
+        }
+        self.cur_stamp
+    }
+
+    fn snap_walkable(&self, idx: usize, max_r: isize) -> Option<usize> {
+        if self.walk[idx] != 0 {
+            return Some(idx);
+        }
+        let w = self.nnx as isize;
+        let h = self.nny as isize;
+        let ci = (idx % self.nnx) as isize;
+        let cj = (idx / self.nnx) as isize;
+        let mut best: Option<usize> = None;
+        let mut best_d2 = isize::MAX;
+        for r in 1..=max_r {
+            for dj in -r..=r {
+                for di in -r..=r {
+                    let ni = ci + di;
+                    let nj = cj + dj;
+                    if ni < 0 || nj < 0 || ni >= w || nj >= h {
+                        continue;
+                    }
+                    let nk = nj as usize * self.nnx + ni as usize;
+                    let d2 = di * di + dj * dj;
+                    if self.walk[nk] != 0 && d2 < best_d2 {
+                        best_d2 = d2;
+                        best = Some(nk);
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        best
     }
 
     pub fn walk_segment(&self, x: f64, y: f64, gx: f64, gy: f64) -> bool {
@@ -186,276 +305,412 @@ impl NavEngine {
         true
     }
 
-    #[inline]
-    pub fn is_pending(&self) -> bool {
-        self.pending_key.is_some()
-    }
+    /// Instant stamped 2 m weighted A* with LOS/walkable string-pulling (ready on tick 0).
+    pub fn next_waypoint(
+        &mut self,
+        tick: u64,
+        x: f64,
+        y: f64,
+        goal: [f64; 2],
+        big_mech: bool,
+    ) -> [f64; 2] {
+        let goal_shift = (goal[0] - self.cached_goal[0]).hypot(goal[1] - self.cached_goal[1]);
+        let need_replan = self.cached_path.is_empty()
+            || tick.saturating_sub(self.last_plan_tick) >= 6
+            || goal_shift > 10.0;
 
-    pub fn field(&mut self, gx: f64, gy: f64) {
-        let key = ((gx / 5.0).round() as i32, (gy / 5.0).round() as i32);
-        if self.pending_key == Some(key) {
-            return;
+        if need_replan {
+            self.cached_path = self.find_path(x, y, goal[0], goal[1], big_mech);
+            self.cached_goal = goal;
+            self.last_plan_tick = tick;
         }
-        if self.pending_key.is_none() && self.goal_key == Some(key) {
-            return;
-        }
-        if self.pending_key.is_some()
-            && (gx - self.pending_goal[0]).hypot(gy - self.pending_goal[1]) < 25.0
+
+        while self.cached_path.len() > 1
+            && (self.cached_path[0][0] - x).hypot(self.cached_path[0][1] - y) < 3.5
         {
-            return;
+            self.cached_path.remove(0);
         }
 
-        self.work.fill(INF);
-        self.hk.clear();
-        self.hv.clear();
-
-        let mut g = self.cell_of(gx, gy);
-        if self.walk[g] == 0 {
-            let w = self.nnx as isize;
-            let h = self.nny as isize;
-            let gi = (g % self.nnx) as isize;
-            let gj = (g / self.nnx) as isize;
-            let mut best: Option<usize> = None;
-            let mut best_d2 = isize::MAX;
-            for r in 1..30_isize {
-                for dj in -r..=r {
-                    for di in -r..=r {
-                        let i = gi + di;
-                        let j = gj + dj;
-                        if i < 0 || j < 0 || i >= w || j >= h {
-                            continue;
-                        }
-                        let k = j as usize * self.nnx + i as usize;
-                        let d2 = di * di + dj * dj;
-                        if self.walk[k] != 0 && d2 < best_d2 {
-                            best_d2 = d2;
-                            best = Some(k);
-                        }
-                    }
-                }
-                if best.is_some() {
-                    break;
-                }
-            }
-            if let Some(bk) = best {
-                g = bk;
-            }
+        if self.cached_path.is_empty() {
+            return goal;
         }
 
-        self.work[g] = 0.0;
-        self.push(g as u32, 0.0);
-        self.pending_key = Some(key);
-        self.pending_goal = [gx, gy];
+        // String-pull up to 12 waypoints ahead along walkable line-of-sight for smooth movement
+        let max_look = self.cached_path.len().min(12);
+        if self.walk[self.cell_of(x, y)] != 0 {
+            for idx in (1..max_look).rev() {
+                let wp = self.cached_path[idx];
+                if self.walk_segment(x, y, wp[0], wp[1]) {
+                    return wp;
+                }
+            }
+        }
+        self.cached_path[0]
     }
 
-    #[inline]
-    fn push(&mut self, k: u32, v: f32) {
-        let mut i = self.hk.len();
-        self.hk.push(v);
-        self.hv.push(k);
-        while i > 0 {
-            let p = (i - 1) >> 1;
-            if self.hk[p] <= v {
-                break;
-            }
-            self.hk[i] = self.hk[p];
-            self.hv[i] = self.hv[p];
-            i = p;
+    fn find_path(
+        &mut self,
+        sx_w: f64,
+        sy_w: f64,
+        gx_w: f64,
+        gy_w: f64,
+        big_mech: bool,
+    ) -> Vec<[f64; 2]> {
+        let Some(start) = self.snap_walkable(self.cell_of(sx_w, sy_w), 6) else {
+            return vec![[gx_w, gy_w]];
+        };
+        let Some(goal) = self.snap_walkable(self.cell_of(gx_w, gy_w), 24) else {
+            return vec![[gx_w, gy_w]];
+        };
+        if start == goal {
+            return vec![[gx_w, gy_w]];
         }
-        self.hk[i] = v;
-        self.hv[i] = k;
-    }
 
-    #[inline]
-    fn pop(&mut self) -> (f32, u32) {
-        let top_v = self.hk[0];
-        let top_k = self.hv[0];
-        let lv = self.hk.pop().unwrap();
-        let lk = self.hv.pop().unwrap();
-        let n = self.hk.len();
-        if n > 0 {
-            let mut i = 0;
-            loop {
-                let mut c = 2 * i + 1;
-                if c >= n {
-                    break;
-                }
-                if c + 1 < n && self.hk[c + 1] < self.hk[c] {
-                    c += 1;
-                }
-                if self.hk[c] >= lv {
-                    break;
-                }
-                self.hk[i] = self.hk[c];
-                self.hv[i] = self.hv[c];
-                i = c;
-            }
-            self.hk[i] = lv;
-            self.hv[i] = lk;
-        }
-        (top_v, top_k)
-    }
-
-    pub fn pump(&mut self, budget_ms: f64, max_iter: usize) {
-        if self.pending_key.is_none() || budget_ms <= 0.0 {
-            return;
-        }
         let w = self.nnx;
         let h = self.nny;
-        let sqrt2 = std::f32::consts::SQRT_2;
-        let t0 = Instant::now();
-        let mut iter = 0_usize;
+        let tx = (goal % w) as f32;
+        let ty = (goal / w) as f32;
+        let stamp = self.next_stamp();
 
-        while !self.hk.is_empty() {
-            iter += 1;
-            if iter > max_iter {
-                return;
-            }
-            if (iter & 1023) == 0 && t0.elapsed().as_secs_f64() * 1000.0 > budget_ms {
-                return;
-            }
-            let (v0, k_u32) = self.pop();
-            let k = k_u32 as usize;
-            if v0 > self.work[k] {
-                continue;
-            }
-            let i = (k % w) as isize;
-            let j = (k / w) as isize;
+        self.stamp[start] = stamp;
+        self.g_score[start] = 0.0;
+        self.parent[start] = u32::MAX;
 
+        let heuristic = |idx: usize| -> f32 {
+            let dx = (idx % w) as f32 - tx;
+            let dy = (idx / w) as f32 - ty;
+            (dx * dx + dy * dy).sqrt() * 2.0
+        };
+
+        let mut open = BinaryHeap::with_capacity(512);
+        let h0 = heuristic(start);
+        open.push(HeapNode {
+            f: h0 * 1.25,
+            idx: start,
+        });
+
+        let mut best_idx = start;
+        let mut best_h = h0;
+        let mut expansions = 0_usize;
+        const MAX_EXPANSIONS: usize = 3600;
+        const STEP_CARD: f32 = 2.0;
+        const STEP_DIAG: f32 = 2.828_427;
+        let tight_pen = if big_mech { 0.85_f32 } else { 0.0 };
+
+        while let Some(HeapNode { idx, .. }) = open.pop() {
+            if idx == goal {
+                best_idx = idx;
+                break;
+            }
+            expansions += 1;
+            if expansions >= MAX_EXPANSIONS {
+                break;
+            }
+
+            let cur_g = self.g_score[idx];
+            let hc = heuristic(idx);
+            if hc < best_h {
+                best_h = hc;
+                best_idx = idx;
+            }
+
+            let ci = (idx % w) as isize;
+            let cj = (idx / w) as isize;
             for dj in -1_isize..=1 {
-                let jj = j + dj;
-                if jj < 0 || jj >= h as isize {
+                let nj = cj + dj;
+                if nj < 0 || nj >= h as isize {
                     continue;
                 }
-                let jju = jj as usize;
-                let ju = j as usize;
+                let nju = nj as usize;
+                let cju = cj as usize;
                 for di in -1_isize..=1 {
                     if di == 0 && dj == 0 {
                         continue;
                     }
-                    let ii = i + di;
-                    if ii < 0 || ii >= w as isize {
+                    let ni = ci + di;
+                    if ni < 0 || ni >= w as isize {
                         continue;
                     }
-                    let iiu = ii as usize;
-                    let kk = jju * w + iiu;
-                    if self.walk[kk] == 0 {
+                    let niu = ni as usize;
+                    let nidx = nju * w + niu;
+                    if self.walk[nidx] == 0 {
                         continue;
                     }
                     if di != 0 && dj != 0 {
-                        let iu = i as usize;
-                        if self.walk[ju * w + iiu] == 0 || self.walk[jju * w + iu] == 0 {
+                        let ciu = ci as usize;
+                        if self.walk[cju * w + niu] == 0 || self.walk[nju * w + ciu] == 0 {
                             continue;
                         }
                     }
-                    let nv = v0 + if di != 0 && dj != 0 { sqrt2 } else { 1.0 };
-                    if nv < self.work[kk] {
-                        self.work[kk] = nv;
-                        self.push(kk as u32, nv);
+                    let step = if di != 0 && dj != 0 {
+                        STEP_DIAG
+                    } else {
+                        STEP_CARD
+                    } + if self.tight[nidx] != 0 { tight_pen } else { 0.0 };
+                    let ng = cur_g + step;
+                    let visited = self.stamp[nidx] == stamp;
+                    if !visited || ng < self.g_score[nidx] {
+                        self.stamp[nidx] = stamp;
+                        self.g_score[nidx] = ng;
+                        self.parent[nidx] = idx as u32;
+                        open.push(HeapNode {
+                            f: ng + heuristic(nidx) * 1.25,
+                            idx: nidx,
+                        });
                     }
                 }
             }
         }
 
-        std::mem::swap(&mut self.dist, &mut self.work);
-        self.goal_key = self.pending_key.take();
-        self.ready_goal = Some(self.pending_goal);
-    }
-
-    pub fn field_for(&self, gx: f64, gy: f64, tol: f64) -> bool {
-        self.ready_goal
-            .map_or(false, |rg| (gx - rg[0]).hypot(gy - rg[1]) < tol)
-    }
-
-    pub fn steer(&self, x: f64, y: f64) -> Option<[f64; 2]> {
-        let w = self.nnx;
-        let h = self.nny;
-        let c = self.cell_of(x, y);
-        let ci = (c % w) as isize;
-        let cj = (c / w) as isize;
-        let start_blocked = self.walk[c] == 0;
-        let mut best = self.dist[c];
-        let mut bi = 0_isize;
-        let mut bj = 0_isize;
-
-        for a in 0..24 {
-            let ang = (a as f64 / 24.0) * 2.0 * PI;
-            let ca = ang.cos();
-            let sa = ang.sin();
-            for r in 1..=5 {
-                let i = ci + (ca * r as f64).round() as isize;
-                let j = cj + (sa * r as f64).round() as isize;
-                if i < 0 || j < 0 || i >= w as isize || j >= h as isize {
-                    break;
-                }
-                let k = j as usize * w + i as usize;
-                if self.walk[k] == 0 {
-                    if start_blocked && r <= 2 {
-                        continue;
-                    }
-                    break;
-                }
-                let v = self.dist[k] + r as f32 * 0.02;
-                if v < best {
-                    best = v;
-                    bi = i - ci;
-                    bj = j - cj;
-                }
+        let mut rev = Vec::with_capacity(64);
+        let mut cur = best_idx;
+        let mut guard = 0_usize;
+        while cur != u32::MAX as usize && guard < 512 {
+            rev.push(self.cell_world(cur));
+            let p = self.parent[cur];
+            if p == u32::MAX {
+                break;
+            }
+            cur = p as usize;
+            guard += 1;
+        }
+        rev.reverse();
+        if rev.len() > 1 {
+            rev.remove(0);
+        }
+        if best_idx == goal {
+            if let Some(last) = rev.last_mut() {
+                *last = [gx_w, gy_w];
             }
         }
-
-        if bi == 0 && bj == 0 {
-            return None;
-        }
-        let l = ((bi * bi + bj * bj) as f64).sqrt();
-        Some([bi as f64 / l, bj as f64 / l])
+        rev
     }
 
-    /// Nearby walkable in-zone point that breaks 3D solid LOS from `primary_eye`
-    /// (and prefers breaking LOS from all active `threat_eyes`).
-    pub fn cover_from(
-        &self,
+    /// Bounded 8-way Dijkstra over the 2 m walkable grid (up to 56 m walk distance).
+    /// Buckets reachable cover & shadow spots into 12 angular sectors x 2 distance rings,
+    /// validates 3D solid LOS against all active threats, and returns `(goal, path, los_count)`.
+    pub fn find_bfs_cover(
+        &mut self,
         x: f64,
         y: f64,
         my_eye_off: f64,
         threat_eyes: &[[f64; 3]],
-        primary_eye: [f64; 3],
-        max_r: f64,
+        escape_dir: [f64; 2],
         zone_center: [f64; 2],
         zone_radius: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
         world: &World,
-    ) -> Option<[f64; 2]> {
-        let safe_r = (zone_radius - 5.0).max(4.0);
-        let mut best: Option<(f64, [f64; 2])> = None;
-        let mut r = 6.0;
-        while r <= max_r {
-            for a in 0..16 {
-                let ang = (a as f64 / 16.0) * 2.0 * PI;
-                let px = x + ang.cos() * r;
-                let py = y + ang.sin() * r;
-                if self.walk[self.cell_of(px, py)] == 0 {
-                    continue;
-                }
-                if (px - zone_center[0]).hypot(py - zone_center[1]) > safe_r {
-                    continue;
-                }
-                let pz = world.terrain_height(px, py);
-                let cand_eye = [px, py, pz + my_eye_off.min(7.0)];
-                if world.raycast_solid(primary_eye, cand_eye).is_none() {
-                    continue;
-                }
-                let extra_los = threat_eyes
-                    .iter()
-                    .filter(|&&te| world.raycast_solid(te, cand_eye).is_none())
-                    .count();
-                let away = (px - primary_eye[0]).hypot(py - primary_eye[1])
-                    - (x - primary_eye[0]).hypot(y - primary_eye[1]);
-                let s = r - away * 0.3 + extra_los as f64 * 25.0;
-                if best.map_or(true, |(bs, _)| s < bs) {
-                    best = Some((s, [px, py]));
+    ) -> Option<([f64; 2], Vec<[f64; 2]>, usize)> {
+        if threat_eyes.is_empty() {
+            return None;
+        }
+        let start = self.snap_walkable(self.cell_of(x, y), 6)?;
+        let w = self.nnx;
+        let h = self.nny;
+        let stamp = self.next_stamp();
+
+        self.stamp[start] = stamp;
+        self.g_score[start] = 0.0;
+        self.parent[start] = u32::MAX;
+
+        let mut open = BinaryHeap::with_capacity(256);
+        open.push(HeapNode { f: 0.0, idx: start });
+
+        let safe_r = (zone_radius - 5.0).max(5.0);
+        let safe_next_r = (next_radius - 8.0).max(4.0);
+        const MAX_WALK_M: f32 = 56.0;
+        const MAX_EXPANSIONS: usize = 680;
+        const STEP_CARD: f32 = 2.0;
+        const STEP_DIAG: f32 = 2.828_427;
+
+        let mut buckets: [Option<(f64, f64, usize, [f64; 2], bool)>; 24] = [None; 24];
+        let mut expansions = 0_usize;
+
+        while let Some(HeapNode { f: cur_g, idx }) = open.pop() {
+            if cur_g > self.g_score[idx] + 1e-3 {
+                continue;
+            }
+            if cur_g > MAX_WALK_M {
+                break;
+            }
+            expansions += 1;
+            if expansions > MAX_EXPANSIONS {
+                break;
+            }
+
+            let ci = (idx % w) as isize;
+            let cj = (idx / w) as isize;
+            let is_edge = self.near_cover[idx] != 0;
+            let is_sample = is_edge || ((ci & 1) == 0 && (cj & 1) == 0);
+
+            if cur_g >= 6.0 && is_sample {
+                let pt = self.cell_world(idx);
+                if (pt[0] - zone_center[0]).hypot(pt[1] - zone_center[1]) <= safe_r {
+                    let dist_me = (pt[0] - x).hypot(pt[1] - y).max(1.0);
+                    let dir_dot = ((pt[0] - x) * escape_dir[0] + (pt[1] - y) * escape_dir[1])
+                        / dist_me;
+                    let pre_score =
+                        dir_dot * 32.0 - (cur_g as f64) * 1.2 + if is_edge { 14.0 } else { 0.0 };
+
+                    let ang = (pt[1] - y).atan2(pt[0] - x);
+                    let sec = (((ang + PI) / (2.0 * PI) * 12.0).floor() as isize)
+                        .clamp(0, 11) as usize;
+                    let ring = if cur_g < 22.0 { 0 } else { 1 };
+                    let bidx = sec * 2 + ring;
+
+                    if buckets[bidx].map_or(true, |b| pre_score > b.0) {
+                        buckets[bidx] = Some((pre_score, cur_g as f64, idx, pt, is_edge));
+                    }
                 }
             }
-            r += 6.0;
+
+            for dj in -1_isize..=1 {
+                let nj = cj + dj;
+                if nj < 0 || nj >= h as isize {
+                    continue;
+                }
+                let nju = nj as usize;
+                let cju = cj as usize;
+                for di in -1_isize..=1 {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }
+                    let ni = ci + di;
+                    if ni < 0 || ni >= w as isize {
+                        continue;
+                    }
+                    let niu = ni as usize;
+                    let nidx = nju * w + niu;
+                    if self.walk[nidx] == 0 {
+                        continue;
+                    }
+                    if di != 0 && dj != 0 {
+                        let ciu = ci as usize;
+                        if self.walk[cju * w + niu] == 0 || self.walk[nju * w + ciu] == 0 {
+                            continue;
+                        }
+                    }
+                    let ng = cur_g + if di != 0 && dj != 0 { STEP_DIAG } else { STEP_CARD };
+                    if ng > MAX_WALK_M {
+                        continue;
+                    }
+                    let visited = self.stamp[nidx] == stamp;
+                    if !visited || ng < self.g_score[nidx] {
+                        self.stamp[nidx] = stamp;
+                        self.g_score[nidx] = ng;
+                        self.parent[nidx] = idx as u32;
+                        open.push(HeapNode { f: ng, idx: nidx });
+                    }
+                }
+            }
+        }
+
+        let mut best: Option<(f64, usize, [f64; 2], usize)> = None;
+        for slot in buckets.iter().flatten() {
+            let &(_, walk_dist, cell_idx, pt, is_edge) = slot;
+            let gz = world.terrain_height(pt[0], pt[1]);
+            let cand_eye = [pt[0], pt[1], gz + my_eye_off];
+
+            let mut los_count = 0_usize;
+            let mut min_threat_d = f64::INFINITY;
+            for &te in threat_eyes {
+                let td = (pt[0] - te[0]).hypot(pt[1] - te[1]);
+                min_threat_d = min_threat_d.min(td);
+                if world.raycast_solid(te, cand_eye).is_none() {
+                    los_count += 1;
+                }
+            }
+
+            let mut score = if los_count == 0 {
+                260.0
+            } else if los_count == 1 {
+                -25.0
+            } else {
+                -(los_count as f64) * 130.0
+            };
+
+            let dist_me = (pt[0] - x).hypot(pt[1] - y).max(1.0);
+            let dir_dot = ((pt[0] - x) * escape_dir[0] + (pt[1] - y) * escape_dir[1]) / dist_me;
+            score += dir_dot * 42.0;
+            score += min_threat_d.min(90.0) * 1.15;
+            score -= walk_dist * 1.85;
+            if is_edge {
+                score += 15.0;
+            }
+            if (pt[0] - next_center[0]).hypot(pt[1] - next_center[1]) > safe_next_r {
+                score -= 22.0;
+            }
+
+            if best.map_or(true, |(bs, _, _, _)| score > bs) {
+                best = Some((score, cell_idx, pt, los_count));
+            }
+        }
+
+        let (_, best_idx, best_pt, best_los) = best?;
+        let mut rev = Vec::with_capacity(32);
+        let mut cur = best_idx;
+        let mut guard = 0_usize;
+        while cur != u32::MAX as usize && guard < 128 {
+            rev.push(self.cell_world(cur));
+            let p = self.parent[cur];
+            if p == u32::MAX {
+                break;
+            }
+            cur = p as usize;
+            guard += 1;
+        }
+        rev.reverse();
+        if rev.len() > 1 {
+            rev.remove(0);
+        }
+        Some((best_pt, rev, best_los))
+    }
+
+    /// Nearest cover-edge walkable cell inside `next_zone` for safe idle positioning.
+    pub fn find_cover_anchor(
+        &self,
+        x: f64,
+        y: f64,
+        next_center: [f64; 2],
+        next_radius: f64,
+        max_dist: f64,
+    ) -> Option<[f64; 2]> {
+        let c = self.cell_of(x, y);
+        let ci = (c % self.nnx) as isize;
+        let cj = (c / self.nnx) as isize;
+        let r_cells = (max_dist * 0.5).ceil() as isize;
+        let safe_r = (next_radius - 10.0).max(5.0);
+
+        let mut best: Option<(f64, [f64; 2])> = None;
+        for dj in (-r_cells..=r_cells).step_by(3) {
+            let nj = cj + dj;
+            if nj <= 3 || nj >= (self.nny as isize - 3) {
+                continue;
+            }
+            for di in (-r_cells..=r_cells).step_by(3) {
+                let ni = ci + di;
+                if ni <= 3 || ni >= (self.nnx as isize - 3) {
+                    continue;
+                }
+                let k = nj as usize * self.nnx + ni as usize;
+                if self.walk[k] == 0 || self.near_cover[k] == 0 {
+                    continue;
+                }
+                let pt = self.cell_world(k);
+                let d_next = (pt[0] - next_center[0]).hypot(pt[1] - next_center[1]);
+                if d_next > safe_r {
+                    continue;
+                }
+                let d_me = (pt[0] - x).hypot(pt[1] - y);
+                if d_me > max_dist {
+                    continue;
+                }
+                let score = -d_me * 1.0 - d_next * 0.25;
+                if best.map_or(true, |(bs, _)| score > bs) {
+                    best = Some((score, pt));
+                }
+            }
         }
         best.map(|(_, pt)| pt)
     }

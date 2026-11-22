@@ -53,7 +53,7 @@ pub fn predict_aim_after_step(
     [wrap_angle(cur[0] + dy), cur[1] + dp]
 }
 
-/// 3-iteration wall-clamped projectile lead (accounts for track `age`).
+/// 3-iteration wall-clamped projectile lead (accounts for track `age` + half-tick latency).
 pub fn lead_aim(
     from: [f64; 3],
     target_pos: [f64; 3],
@@ -63,12 +63,12 @@ pub fn lead_aim(
     world: &World,
 ) -> [f64; 2] {
     let mut pred = [
-        target_pos[0] + target_vel[0] * age,
-        target_pos[1] + target_vel[1] * age,
+        target_pos[0] + target_vel[0] * (age + 0.05),
+        target_pos[1] + target_vel[1] * (age + 0.05),
         target_pos[2],
     ];
     for _ in 0..3 {
-        let tt = (dist_3d(from, pred) / proj_speed.max(1.0)).clamp(0.0, 1.2);
+        let tt = (dist_3d(from, pred) / proj_speed.max(1.0) + 0.04).clamp(0.04, 1.2);
         let cand = [
             target_pos[0] + target_vel[0] * (tt + age),
             target_pos[1] + target_vel[1] * (tt + age),
@@ -257,9 +257,9 @@ pub fn solve_mortar(
     None
 }
 
-/// Wall-safe bullet/mortar/laser evasion: static + relative-velocity lead-shot detection,
-/// scaled mortar splash radius, and enemy laser-line perpendicular dodge.
-pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2], bool) {
+/// Wall-safe bullet/mortar/laser evasion.
+/// Returns `(dodge_vec, urgent_dodge, heavy_threat)`.
+pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2], bool, bool) {
     let pos = obs.me.pos;
     let my_vel = obs.me.vel;
     let height = obs.me.height();
@@ -267,6 +267,7 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
     let radius = obs.me.radius();
     let mut dodge = [0.0, 0.0];
     let mut urgent = false;
+    let mut heavy_threat = false;
 
     let step_ok = |ux: f64, uy: f64| -> bool {
         world.is_walkable_step(
@@ -318,6 +319,9 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                         dodge[0] += fx * w;
                         dodge[1] += fy * w;
                         urgent = true;
+                        if t_imp < 1.3 {
+                            heavy_threat = true;
+                        }
                     }
                     break;
                 }
@@ -332,36 +336,40 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             let spd = v2.sqrt();
             let px = -p.vel[1] / spd;
             let py = p.vel[0] / spd;
-            let thresh = radius + 2.3;
+            let thresh = radius + 2.2;
 
             let t_stat = (rx * p.vel[0] + ry * p.vel[1]) / v2;
             let mx_stat = my_center[0] - (p.pos[0] + p.vel[0] * t_stat);
             let my_stat = my_center[1] - (p.pos[1] + p.vel[1] * t_stat);
             let cz_stat = p.pos[2] + p.vel[2] * t_stat;
             let miss_d_stat = mx_stat.hypot(my_stat);
-            let stat_threat = (0.0..=0.85).contains(&t_stat)
+            let stat_threat = (0.0..=0.80).contains(&t_stat)
                 && (cz_stat - my_center[2]).abs() <= height * 0.65
                 && miss_d_stat < thresh;
 
             let rvx = p.vel[0] - my_vel[0];
             let rvy = p.vel[1] - my_vel[1];
             let rv2 = rvx * rvx + rvy * rvy;
-            let (rel_threat, t_rel, mx_rel, my_rel) = if rv2 >= 4.0 {
+            let (rel_threat, t_rel, mx_rel, my_rel, miss_r) = if rv2 >= 4.0 {
                 let tr = (rx * rvx + ry * rvy) / rv2;
                 let mxr = rx - rvx * tr;
                 let myr = ry - rvy * tr;
                 let czr = p.pos[2] + p.vel[2] * tr;
                 let my_zr = my_center[2] + my_vel[2] * tr;
-                let miss_r = mxr.hypot(myr);
-                let hit = (0.0..=0.85).contains(&tr)
+                let mr = mxr.hypot(myr);
+                let hit = (0.0..=0.80).contains(&tr)
                     && (czr - my_zr).abs() <= height * 0.65
-                    && miss_r < thresh;
-                (hit, tr, mxr, myr)
+                    && mr < thresh;
+                (hit, tr, mxr, myr, mr)
             } else {
-                (false, t_stat, mx_stat, my_stat)
+                (false, t_stat, mx_stat, my_stat, miss_d_stat)
             };
 
             if stat_threat || rel_threat {
+                // Skip bullets that will slam into a solid wall before reaching us
+                if world.raycast_solid(p.pos, my_center).is_some() {
+                    continue;
+                }
                 let side_stat = mx_stat * px + my_stat * py;
                 let side_rel = mx_rel * px + my_rel * py;
                 let mut sign = if side_stat.abs() >= 0.4 {
@@ -377,7 +385,8 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
                 dodge[0] += px * sign * 3.4;
                 dodge[1] += py * sign * 3.4;
                 let t_hit = if rel_threat { t_rel } else { t_stat };
-                if t_hit < 0.45 && (rel_threat || miss_d_stat < radius + 1.1) {
+                let tight_miss = if rel_threat { miss_r } else { miss_d_stat };
+                if t_hit < 0.45 && tight_miss < radius + 0.9 {
                     urgent = true;
                 }
             }
@@ -421,8 +430,9 @@ pub fn compute_dodge(obs: &ObsMsg, cfg: &RuleConfig, world: &World) -> ([f64; 2]
             dodge[0] += side_x * sign * 5.2;
             dodge[1] += side_y * sign * 5.2;
             urgent = true;
+            heavy_threat = true;
         }
     }
 
-    (dodge, urgent)
+    (dodge, urgent, heavy_threat)
 }
